@@ -26,53 +26,6 @@
 
 这套 21 章中文学习笔记面向写过代码、调过 API、大致了解 function calling 的读者。每章结合源码和项目案例，讲清 Agent harness 的关键设计与取舍，说明为什么这样选、条件变了该怎么判断。学完能用具体例子回答相关面试题。
 
-## 课程示例
-
-点开预览图，就能看到对应的课件原页，再顺着正文里的行号读源码。
-
-### 第 15 章 · 两次请求开头一样，模型服务能复用多少计算
-
-两次请求的 system 一样，为什么缓存命中用量还会变？左侧目录列出了整篇的阅读路线。正文把原目录、切到工作树和工具重排三种请求放在同一张 A／B／C 对照表里，逐项比较工具顺序和请求前缀。
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/prefix-cache.html"><img alt="第 15 章首屏，包含左侧目录、文章标题和三次请求对照" src="docs/assets/lesson-layout-16.png"></a>
-
-把三次请求并排，先找到共同开头从哪一处断开，再用服务回包核对实际命中量。章末还可以用面经自测。 [直达 A／B／C 请求表](https://hmmgotit.github.io/RuoCun/learning/revised/prefix-cache.html#prefix-as-sequence)
-
-<details>
-<summary>第 4 章 · 改价怎样找对位置、保留已有修改并验对结果？</summary>
-
-同事给会员函数加了一行日志。即使普通价函数的原文还能唯一匹配，这次 `Edit` 为什么要先停下来？
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/file-editing.html"><img alt="第 4 章首屏，包含左侧目录和订单预览仍显示 200 元的案例" src="docs/assets/lesson-layout-06.png"></a>
-
-</details>
-
-<details>
-<summary>第 16 章 · 上一次的经验，这次还能照着用吗</summary>
-
-照着上次的经验跑测试，退出码是 0。怎样确认测试走的就是会员页面正在用的代码？
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/memory-use.html"><img alt="第 16 章首屏，包含左侧目录与旧测试和当前页面的入口对照" src="docs/assets/lesson-layout-17.png"></a>
-
-</details>
-
-<details>
-<summary>展开文件编辑、摘要回查与经验验证的课件图解</summary>
-
-**第 4 章** · 下一次编辑时，磁盘上的文件跟刚才读取的一样吗？
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/file-editing.html#stale-observation"><img width="680" alt="读取基线图，对比原文件记录与后来发生变化的磁盘记录" src="docs/learning/revised/figures/file-baseline-engineering.svg"></a>
-
-**第 14 章** · 做了两次压缩以后，如何沿着旧摘要找回会员订单的测试回执？
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/archive-retrieval.html#summary-lineage-paths"><img width="680" alt="摘要 2 通过直接原文和旧摘要两条路线找到原始消息" src="docs/learning/revised/figures/archive-lineage-engineering.svg"></a>
-
-**第 16 章** · 上次的回归用例在当前任务里还测得到正确入口吗？
-
-<a href="https://hmmgotit.github.io/RuoCun/learning/revised/memory-use.html#memory-case"><img width="680" alt="旧测试仍走旧函数，当前页面已经走另一条入口" src="docs/learning/revised/figures/memory-current-entry-engineering.svg"></a>
-
-</details>
-
 ## 五题缓存对照
 
 **五道同题实测，若存输入缓存命中率 99.34%，DeepSeek Harness 为 99.07%。**
@@ -93,6 +46,8 @@
 ## Terminal-Bench 2.1
 
 **在 Terminal-Bench 2.1 项目自测中，若存通过 71 / 89 项任务（79.78%）。与官方榜的 Codex + GPT‑6 Astra（xhigh，85.8%）相差约 6 个百分点，按 89 题折算约 5 题。**
+
+89 题共记录 4,927 次 API 请求，其中 4,922 次有确认用量。按这些请求的输入 token 汇总，**缓存命中率为 99.22%**（348,210,560 / 350,961,719）。先计算每题的缓存命中率，再对 89 题等权平均，得到 **98.82%**。
 
 89 题自测使用 DeepSeek 官方模型 **DeepSeek-V4.1-Flash-1017**，API 模型名为 `deepseek-flash`，主请求配置为 `max`。五题缓存对照的双方也使用该模型，前三题的主请求配置为 `high`，后两题为 `max`。 [模型版本](https://api-docs.deepseek.com/updates/#deepseek-v41-flash-1017-update) · [五题对照条件](docs/benchmark/README.md#五道同题的缓存命中)
 
