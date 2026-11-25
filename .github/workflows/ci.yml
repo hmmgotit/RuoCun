@@ -28,7 +28,8 @@ jobs:
           python-version: '3.11.9'
           architecture: x64
       - name: Lint, type check, build, install and test
-        run: python -I -X utf8 .github/ci/windows_gate.py --state .cache/ci --without-native-mxc
+        shell: pwsh
+        run: .github/ci/windows_hosted.ps1
       - name: Report failed installed test names
         if: failure()
         shell: pwsh

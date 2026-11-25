@@ -13,3 +13,5 @@ python -I -X utf8 .github/ci/windows_gate.py --state .cache/ci/local-001 --mxc-e
 GitHub `ci.yml` 在 Windows 执行同一入口。Ubuntu、macOS 任务核对 Python 3.11 语法、来源导入和原生 Shell 适配，记录独立平台结果。Python 分发包目前带 Windows x64 标签，POSIX 任务是适配核验。`package-candidate.yml` 手动触发，构建 Windows 标准包并保留工作流产物，发布权限为只读。Windows 两个任务只在成功时上传产物，失败原始回执留在执行环境的状态目录。[GitHub Python CI 文档](https://docs.github.com/en/actions/tutorials/build-and-test-code/python)
 
 Windows 托管任务显式传 `--without-native-mxc`。该模式运行安装验证、可移植回归及后端缺失拒绝测试，原生 `native_mxc` 用例属于单独的验收。完整验收使用当前支持 ProcessContainer 的 Windows 11 x64 主机，传 `--mxc-exec` 指定官方固定版，入口校验执行器摘要和主机探测。仓库默认分支可以手动选择 `native_mxc` 工作流输入，在具备 CPython 3.11.9 的可信自托管 `ruocun-mxc` 执行器上验证。该执行器需要设置仓库变量 `RUOCUN_CI_MXC_EXEC` 为官方二进制的绝对路径。 [微软支持的宿主版本](https://github.com/microsoft/mxc/blob/v1.1.0/docs/backends/process-container/os-version-support.md)
+
+GitHub 托管任务在一次性普通 Windows 账号下运行，以复现日常安装的文件所有者规则。账号可读取源码，并在测试状态目录和独立临时目录写入。失败日志只显示用例名，省略参数和异常内容。

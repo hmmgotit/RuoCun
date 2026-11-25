@@ -18,10 +18,10 @@ def test_incremental_utf8_and_oem_selection_preserves_bytes():
     text = "中文🙂\n".encode("utf-8")
     output = "".join(decoder.feed(bytes([value])) for value in text) + decoder.finish()
     assert output == "中文🙂\n"
-    if os.name == "nt":
-        decoder = ShellOutputDecoder("auto:oem")
-        raw = "中文\n".encode("oem")
-        assert decoder.feed(raw) + decoder.finish() == "中文\n"
+    for codec, expected in (("cp437", "café\n"), ("cp936", "中文\n")):
+        decoder = ShellOutputDecoder(f"auto:{codec}")
+        raw = expected.encode(codec)
+        assert decoder.feed(raw) + decoder.finish() == expected
         assert decoder.diagnostics
     decoder = ShellOutputDecoder("utf-8")
     assert decoder.feed(b"ok\xff") + decoder.finish() == "ok\\xff"
@@ -64,7 +64,7 @@ time.sleep(.5)
         "OPENAI_API_KEY": "synthetic-must-be-removed",
     }
     result = run_foreground_argv(
-        [sys.executable, "-I", str(script), "空格 \"双引号\" '单引号' % ! ^ $"],
+        [sys.executable, "-I", "-X", "utf8", str(script), "空格 \"双引号\" '单引号' % ! ^ $"],
         str(tmp_path),
         threading.Event(),
         environ=env,
@@ -87,7 +87,10 @@ def test_explicit_powershell_error_is_readable(tmp_path):
     from ruocun.platform.process_tree import run_foreground_plan
     from ruocun.platform.shell_plan import buildShellPlan
 
-    script = "Write-Error '合成错误中文'"
+    script = (
+        "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
+        "Write-Error '合成错误中文'"
+    )
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     engine = (
         Path(os.environ.get("SYSTEMROOT", r"C:\Windows"))

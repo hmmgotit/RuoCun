@@ -126,10 +126,11 @@ def main() -> int:
             dev = venv("development")
             dependencies(dev, "requirements-dev-win311.lock", "development-dependencies")
         if args.stage in {"all", "static"}:
-            run("ruff", dev, "-m", "ruff", "check", ".")
+            ruff_cache = state / "ruff-cache"
+            run("ruff", dev, "-m", "ruff", "check", "--cache-dir", ruff_cache, ".")
             ci_modules = sorted((REPO / ".github" / "ci").glob("*.py"))
-            run("ruff-ci", dev, "-m", "ruff", "check", "--no-force-exclude", *ci_modules)
-            run("mypy", dev, "-m", "mypy")
+            run("ruff-ci", dev, "-m", "ruff", "check", "--cache-dir", ruff_cache, "--no-force-exclude", *ci_modules)
+            run("mypy", dev, "-m", "mypy", "--cache-dir", state / "mypy-cache")
         if args.stage == "static":
             return 0
         installed = args.installed_python.resolve(strict=True) if args.installed_python else None
@@ -169,7 +170,8 @@ def main() -> int:
                 REPO / "tests" / "support", cwd=work)
             selection = ["-m", "not oracle and not live and not terminal and not install and not native_mxc"] if mxc is None else []
             run("installed-pytest", qa, "-c", _PYTEST, git, work / "managed", mxc or "-",
-                "-q", "--basetemp", work / "pytest", "--junitxml", state / "windows-junit.xml", *selection)
+                "-q", "-o", f"cache_dir={state / 'pytest-cache'}", "--basetemp", work / "pytest",
+                "--junitxml", state / "windows-junit.xml", *selection)
     except subprocess.CalledProcessError as exc:
         return exc.returncode
     return 0

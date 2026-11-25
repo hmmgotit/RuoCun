@@ -146,9 +146,10 @@ def test_cwd_script_shadow_is_not_readonly(tmp_path):
 @pytest.mark.skipif(os.name != "nt", reason="actual PowerShell AST")
 def test_powershell_call_operator_preserves_inner_deny(tmp_path):
     async def scenario():
-        script="& cmd /c 'del target.txt'"
+        system = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32"
+        script = f"& '{system / 'cmd.exe'}' /c 'del target.txt'"
         encoded=base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-        engine=Path(os.environ.get("SYSTEMROOT",r"C:\Windows"))/"System32/WindowsPowerShell/v1.0/powershell.exe"
+        engine = system / "WindowsPowerShell/v1.0/powershell.exe"
         command=f'"{engine}" -NoProfile -NonInteractive -EncodedCommand {encoded}'
         async def ask(text):
             raise AssertionError("nested deny must not ask")
