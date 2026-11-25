@@ -227,6 +227,24 @@ class StorageWorker:
         ref, execution, payload = copy.deepcopy((tool_ref, run_ref, snapshot))
         return self._enqueue_write(lambda port, owner: port.prepare_shell(owner, ref, execution, payload))
 
+    def enqueue_shell_retirement(self, run_ref: RunRef, directory_identity: tuple[int, int]) -> OperationHandle[None]:
+        return self._enqueue_write(lambda port, owner: port.retire_shell_history(owner, run_ref, directory_identity))
+
+    def enqueue_finish_shell_retirement(self, run_id: str) -> OperationHandle[None]:
+        return self._enqueue_write(lambda port, owner: port.finish_shell_retirement(owner, run_id))
+
+    async def pending_shell_retirements(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            if self._closed:
+                raise StoreError("会话存储线程已关闭。")
+
+            def read() -> dict[str, dict[str, Any]]:
+                port, _ = self._opening.result()
+                return port.pending_shell_retirements()
+
+            future = self._executor.submit(read)
+        return await _wait_without_cancelling(future)
+
     def enqueue_shell_run(self, run: RunRecord) -> OperationHandle[None]:
         saved = copy.deepcopy(run)
         return self._enqueue_write(lambda port, owner: port.commit_shell_run(owner, saved))

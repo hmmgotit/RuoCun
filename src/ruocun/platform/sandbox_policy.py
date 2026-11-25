@@ -1,4 +1,4 @@
-"""集中管理 Windows 沙箱的写入范围，供子进程和宿主侧文件工具共同判断。
+"""集中管理 Windows 受管命令的沙箱写入范围。
 
 检查前先规范化路径。受保护的控制目录优先拒绝，即使它同时位于可写范围内。
 """
@@ -61,7 +61,7 @@ class SandboxPolicy:
 
 def createSandboxPolicy(workspaceRoot: str | Path, environ: Mapping[str, str] | None = None) -> SandboxPolicy | None:
     values = os.environ if environ is None else environ
-    if sys.platform != "win32" or resolve_env("SANDBOX", values) != "1":
+    if sys.platform != "win32":
         return None
     workspace = Path(canonical(workspaceRoot))
     if workspace.parent == workspace:
@@ -69,8 +69,8 @@ def createSandboxPolicy(workspaceRoot: str | Path, environ: Mapping[str, str] | 
     lowered = {key.casefold(): value for key, value in values.items()}
     home = lowered.get("userprofile") or lowered.get("home") or str(Path.home())
     base = Path(canonical(home)) / ".ruocun" / "sandbox"
-    executable = canonical(resolve_env("SANDBOX_CLI", values) or
-                           str(base.parent / "dependencies/codex/0.169.0/bin/codex.exe"))
+    executable = canonical(resolve_env("MXC_EXEC", values) or
+                           str(base.parent / "dependencies/mxc/1.1.0/bin/x64/wxc-exec.exe"))
     package = Path(executable).parent
     if package.name.casefold() == "bin":
         package = package.parent
@@ -80,7 +80,7 @@ def createSandboxPolicy(workspaceRoot: str | Path, environ: Mapping[str, str] | 
     user_root = base.parent
     protected = tuple(dict.fromkeys((state, str(user_root / "sessions"), str(user_root / "runtime"),
                                      str(package), canonical(sys.prefix), canonical(sys.base_prefix))))
-    return SandboxPolicy(executable, state, str(work / "temp"), str(work / "cache"),
+    return SandboxPolicy(executable, state, str(work / "temp"), str(work / "temp" / "cache"),
                          (str(workspace),), protected)
 
 

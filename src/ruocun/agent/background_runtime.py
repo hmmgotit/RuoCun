@@ -285,7 +285,8 @@ class BackgroundRuntime:
             or not record.snapshot.get("receipt_digest")
         ):
             raise ValueError("Shell终态导入缺少原运行关闭收据。")
-        if event.type != "started" and old is None and not import_receipt:
+        registering_monitor = snapshot.kind == "monitor" and snapshot.status == "launching" and event.type == "progress"
+        if event.type != "started" and old is None and not import_receipt and not registering_monitor:
             if require_commit:
                 raise RuntimeError("后台事件缺少已登记的同一运行。")
             return
@@ -389,7 +390,7 @@ class BackgroundRuntime:
         return [
             snapshot
             for snapshot in self.snapshots()
-            if snapshot.status in {"running", "canceling"}
+            if snapshot.status in {"launching", "running", "canceling"}
         ]
 
     def events(self) -> list[BackgroundEvent]:

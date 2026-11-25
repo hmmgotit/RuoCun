@@ -6,8 +6,8 @@ import copy
 import os
 import threading
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping
-from contextlib import AbstractAsyncContextManager, contextmanager, nullcontext
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -331,9 +331,7 @@ def prepareAgentRun(
                         setMode=None if mode == "plan" else permit.setMode, askChoice=None,
                         requestTaskWait=None, rollbackTaskWait=None, onShellOutput=None,
                         getShellPlan=permit.getShellPlan,
-                        sandboxPolicy=permit.sandboxPolicy,
                         authorizeSandboxShell=permit.authorizeSandboxShell,
-                        approveSandboxWrite=permit.approveSandboxWrite,
                         searchTools=lambda query: child_registry.searchAndActivateDeferred(query, parent_ctx.lang)
                         + "\n" + child_registry.searchAndActivateMcp(query))
     child_options: StreamChatOptions = {**options, "model": model, "background": True}
@@ -375,13 +373,6 @@ async def runPreparedAgent(
 
     permit = prepared.permission
 
-    @contextmanager
-    def sandbox_call_scope() -> Iterator[None]:
-        # 旧版项目外读取的回调属于父会话，沙箱写入归子会话。
-        # 每次子代理工具调用前重置这两种单次授权。
-        with prepared.parent_permissions.callScope(), permit.callScope():
-            yield
-
     prepared.ctx.archiveRead = getattr(journal, "archive_read", None)
     context = ContextManager(prepared.session, cast(ContextJournal, journal), prepared.ctx,
                              prepared.options, dict(prepared.env), lambda _message: None,
@@ -396,9 +387,7 @@ async def runPreparedAgent(
                 prepared.session, prepared.options, prepared.registry, prepared.ctx,
                 authorization=ToolAuthorization(
                     authorize_batch=permit.authorizeBatch,
-                    call_scope=(
-                        sandbox_call_scope if permit.sandboxPolicy is not None else prepared.parent_permissions.callScope
-                    ),
+                    call_scope=prepared.parent_permissions.callScope,
                     permission_mode=permit.getMode,
                 ),
                 request=request or request_model, journal=journal, tool_batch_scope=tool_batch_scope,

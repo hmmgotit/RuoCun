@@ -12,6 +12,8 @@ from time import time_ns
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ..hooks.journal import HookOutcomeUnknown, hookIntentId
+from ..platform.process_tree import ShellLaunchRejected
+from ..platform.sandbox import SandboxUnavailable
 from ..session.contract import (
     ArchiveImport,
     ArchiveRewrite,
@@ -240,10 +242,13 @@ class TaskManager:
         snapshot = ExecutionSnapshot(task.id, task.runId, "monitor", True, task.description, status,
                                      result=text if terminal else None)
         data = {**record.snapshot, "monitor_output_seq": seq}
+        started = status == "running" and task.status == "launching"
+        if started:
+            data["startedAt"] = time_ns() // 1_000_000
         if terminal:
             data["endedAt"] = time_ns() // 1_000_000
         updated = replace(record, status=status, cancel_requested=record.cancel_requested or status == "canceling", snapshot=data)
-        event: EventType = cast(EventType, status) if terminal else "message" if text is not None else "started" if task.id not in self._tasks else "progress"
+        event: EventType = cast(EventType, status) if terminal else "message" if text is not None else "started" if started else "progress"
         event_id = f"{task.runId}:monitor-output:{seq}" if text is not None and not terminal else None
         safe = self.conversation.redact(text) if text is not None else None
         snapshot = replace(snapshot, result=safe if terminal else None)
@@ -251,6 +256,8 @@ class TaskManager:
                                                      text is not None and not terminal, event_id), updated, require_commit=True)
         execution.record = updated
         task.status = status
+        if started:
+            task.startedAt = data["startedAt"]
         if terminal:
             task.endedAt = data["endedAt"]
             if status == "completed":
@@ -263,17 +270,15 @@ class TaskManager:
         async with self._lock:
             if self._closed or self.conversation.blocked or parent_signal.is_set():
                 raise ToolRejected("当前会话不能启动监控，命令未执行。")
-            started = time_ns() // 1_000_000
             ref = RunRef(f"monitor-{uuid.uuid4().hex}", str(uuid.uuid4()))
             safe = self.conversation.redact(description)
-            task = BgTask(ref.task_id, ref.run_id, "monitor", safe, "running", startedAt=started)
-            record = RunRecord(ref, "monitor", "running", False, {
+            task = BgTask(ref.task_id, ref.run_id, "monitor", safe, "launching")
+            record = RunRecord(ref, "monitor", "launching", False, {
                 "monitor_epoch": self.conversation.owner_epoch, "parent_tool_ref": asdict(parent), "description": safe,
                 "command": plan.command, "cwd": plan.cwd, "timeout_ms": timeout_ms, "persistent": timeout_ms is None,
-                "startedAt": started,
             })
             execution = _MonitorExecution(task, record, plan, threading.Event())
-            await self._publish_monitor(execution, "running")
+            await self._publish_monitor(execution, "launching")
             self._monitors[ref.run_id] = execution
             self._tasks[task.id] = task
             execution.executor = asyncio.create_task(self._execute_monitor(execution), name="ruocun-monitor-" + ref.run_id)
@@ -281,6 +286,11 @@ class TaskManager:
 
     async def _execute_monitor(self, execution: _MonitorExecution) -> None:
         task = execution.task
+
+        async def confirm_start() -> None:
+            async with self._lock:
+                if self._monitors.get(task.runId) is execution and task.status == "launching":
+                    await self._publish_monitor(execution, "running")
 
         async def emit(text: str) -> None:
             async with self._lock:
@@ -301,8 +311,10 @@ class TaskManager:
                         break
                     await asyncio.sleep(.05)
             result = await runMonitor(execution.plan, task.description, execution.signal,
-                                      timeout_ms=execution.record.snapshot["timeout_ms"], emit=emit)
+                                      timeout_ms=execution.record.snapshot["timeout_ms"], emit=emit, onStarted=confirm_start)
             status: ExecutionStatus = "canceled" if task.status == "canceling" else "completed"
+        except (SandboxUnavailable, ShellLaunchRejected) as error:
+            status, result = "failed", str(error)
         except BaseException as error:
             status, result = "unknown", f"监控停止或输出结果未确认（{type(error).__name__}），保留现场。"
         try:
@@ -322,7 +334,7 @@ class TaskManager:
         return list(self._tasks.values())
 
     def running(self) -> list[BgTask]:
-        return [task for task in self.all() if task.status in {"running", "canceling"}]
+        return [task for task in self.all() if task.status in {"launching", "running", "canceling"}]
 
     def _gc(self) -> None:
         finished = sorted((task for task in self._tasks.values() if isTerminal(task.status)), key=lambda task: task.endedAt or 0)
@@ -873,7 +885,7 @@ class TaskManager:
     async def cancel(self, task_id: str) -> Literal["canceling", "canceled"] | None:
         async with self._lock:
             task = self._tasks.get(task_id)
-            if task is None or task.status != "running":
+            if task is None or task.status not in {"launching", "running"}:
                 return None
             if task.kind == "manual":
                 record = await self._task_record(task)

@@ -30,6 +30,7 @@ def test_plan_rejects_null_bytes(tmp_path):
         buildShellPlan("echo abc\0def", str(tmp_path))
 
 
+@pytest.mark.native_mxc
 def test_plan_decision_and_real_execution(tmp_path):
     async def scenario():
         prompts = []
@@ -109,6 +110,7 @@ def test_batch_plan_context_is_retained_by_dispatch_task(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd native commandline")
+@pytest.mark.native_mxc
 def test_cmd_approved_redirection_preserves_unicode_spaced_path(tmp_path):
     async def scenario():
         target=tmp_path/"中文 空格.txt"

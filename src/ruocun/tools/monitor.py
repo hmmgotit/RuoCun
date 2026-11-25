@@ -52,8 +52,8 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     timeout = None if args.get("persistent", False) else args.get("timeout_ms", 300000)
     task = await manager.launch_monitor(plan, args["description"], timeout_ms=timeout,
                                         parent=manager.conversation.current_agent_parent(), parent_signal=ctx.signal)
-    return (f"已在后台启动监控(task id={task.id}):{task.description}。命令输出会按行批量作为通知推送给你,不用轮询;"
-            "想提前结束用 TaskStop。")
+    return (f"已登记监控(task id={task.id})，等待沙箱启动：{task.description}。"
+            "命令输出会按行批量推送。想提前结束用 TaskStop。")
 
 
 monitorTool = Tool(

@@ -23,7 +23,7 @@ WRITE = Tool("Write", "", objectSchema({}, []), "write", unused)
 READ = Tool("Read", "", objectSchema({}, []), "read", unused)
 
 
-def test_source_sandbox_bypass_needs_current_human_approval(tmp_path):
+def test_managed_shell_rejects_legacy_bypass_even_when_tools_are_allowed(tmp_path):
     async def scenario():
         requests = []
 
@@ -39,11 +39,9 @@ def test_source_sandbox_bypass_needs_current_human_approval(tmp_path):
         )
         raw = json.dumps({"command": "echo synthetic", "dangerouslyDisableSandbox": True})
         for call_id in ("first", "second"):
-            assert await runtime.authorizeBatch([BatchCall(call_id, bash, raw, "allow")]) == {call_id: True}
-        assert [request["id"] for request in requests] == ["first", "second"]
-        assert all(request["noPersist"] and "沙箱" in request["summary"] for request in requests)
+            assert await runtime.authorizeBatch([BatchCall(call_id, bash, raw, "allow")]) == {call_id: False}
         assert await runtime.authorizeBatch([BatchCall("denied", bash, raw, "deny")]) == {"denied": False}
-        assert len(requests) == 2
+        assert not requests
 
     asyncio.run(scenario())
 

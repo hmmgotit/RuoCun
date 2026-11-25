@@ -1,6 +1,6 @@
-"""按实际平台封装命令计划，应用可选的文件和网络沙箱。
+"""按实际平台封装受管 Shell 命令计划。
 
-开启后按环境选择 Windows MXC、macOS sandbox-exec 或 Linux bwrap。启动准备失败会返回明确错误，避免命令落到普通 Shell 执行。
+Windows 使用 MXC，macOS 使用 sandbox-exec，Linux 使用 bwrap。缺少后端或无法准备策略时拒绝启动。
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from .shell_plan import ShellExecutionPlan
 
 _BINARY_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin")
+_BYPASS_ERROR = "受管 Shell 沙箱不能整次绕过。"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -30,10 +31,6 @@ class SpawnSpec(TypedDict):
 
 class SandboxError(TypedDict):
     error: str
-
-
-def sandboxActive(environ: Mapping[str, str] | None = None) -> bool:
-    return resolve_env("SANDBOX", os.environ if environ is None else environ) == "1"
 
 
 def sandboxNoNet(environ: Mapping[str, str] | None = None) -> bool:
@@ -57,44 +54,49 @@ def _seatbelt(cwd: str, no_net: bool) -> str:
 
 def sandboxSpawn(command: str, cwd: str, disableSandbox: bool = False, *,
                  environ: Mapping[str, str] | None = None, platform: str | None = None,
-                 exists: Callable[[str], bool] = os.path.exists) -> SpawnSpec | SandboxError | None:
-    if not sandboxActive(environ) or disableSandbox:
-        return None
+                 exists: Callable[[str], bool] = os.path.exists) -> SpawnSpec | SandboxError:
+    """为 POSIX 沙箱组装启动参数。Windows 需要完整的原生命令计划。"""
+    if disableSandbox:
+        return {"error": _BYPASS_ERROR}
     current = sys.platform if platform is None else platform
     shell = ["/bin/sh", "-c", command]
     no_net = sandboxNoNet(environ)
     if current == "darwin":
         binary = _binary("sandbox-exec", exists)
         if binary is None:
-            return {"error": "RUOCUN_SANDBOX=1 但找不到 sandbox-exec"}
+            return {"error": "找不到 sandbox-exec，受管 Shell 命令未执行。"}
         return {"file": binary, "args": ["-p", _seatbelt(cwd, no_net), *shell]}
     if current == "linux":
         binary = _binary("bwrap", exists)
         if binary is None:
-            return {"error": "RUOCUN_SANDBOX=1 但找不到 bwrap(请装 bubblewrap)"}
-        args = ["--ro-bind", "/", "/", "--bind", cwd, cwd, "--tmpfs", "/tmp",
+            return {"error": "找不到 bwrap(请装 bubblewrap)，受管 Shell 命令未执行。"}
+        # 先挂载私有临时目录，再绑定工作区，避免位于 /tmp 的工作区被掩盖。
+        args = ["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", cwd, cwd,
                 "--proc", "/proc", "--dev", "/dev", "--die-with-parent"]
         if no_net:
             args.append("--unshare-net")
         return {"file": binary, "args": [*args, *shell]}
-    return {"error": "当前平台不支持沙箱(仅 macOS/Linux)"}
+    if current == "win32":
+        return {"error": "Windows MXC 沙箱需要原生 Shell 执行计划。"}
+    return {"error": "当前平台不支持受管 Shell 沙箱，命令未执行。"}
 
 
 def sandboxExecutionPlan(plan: ShellExecutionPlan, disableSandbox: bool = False) -> ShellExecutionPlan:
     """用本平台的沙箱包装已审批命令，保留计划中的原命令与工作目录。"""
-    if sys.platform == "win32" and (plan.sandbox is not None or sandboxActive(dict(plan.environment))):
-        if disableSandbox:
-            raise SandboxUnavailable("Windows 沙箱已开启，不能整次绕过；请请求本次额外可写目录。")
+    if disableSandbox:
+        raise SandboxUnavailable(_BYPASS_ERROR)
+    if sys.platform == "win32":
         from .sandbox_policy import canonical, createSandboxPolicy, sandboxEnvironment
         from .windows.sandbox import (
             WindowsSandboxError,
             validateWindowsSandbox,
             windowsSandboxExecutionPlan,
         )
-        policy = plan.sandbox or createSandboxPolicy(plan.cwd, dict(plan.environment))
-        assert policy is not None
         try:
-            if canonical(plan.argv[0]) == canonical(policy.executable) and plan.commandLine is None:
+            policy = plan.sandbox or createSandboxPolicy(plan.cwd, dict(plan.environment))
+            if policy is None:
+                raise SandboxUnavailable("Windows MXC 沙箱缺少执行策略，命令未执行。")
+            if plan.sandbox is not None and plan.argv and plan.commandLine is None and canonical(plan.argv[0]) == policy.executable:
                 validateWindowsSandbox(policy.executable)
                 return plan
             environment = sandboxEnvironment(dict(plan.environment), policy)
@@ -106,9 +108,10 @@ def sandboxExecutionPlan(plan: ShellExecutionPlan, disableSandbox: bool = False)
             )
         except (OSError, ValueError, WindowsSandboxError) as error:
             raise SandboxUnavailable(f"Windows MXC 沙箱启动准备失败，命令未执行：{error}") from error
-    spec = sandboxSpawn(plan.command, plan.cwd, disableSandbox, environ=dict(plan.environment))
-    if spec is None:
-        return plan
+    spec = sandboxSpawn(plan.command, plan.cwd, environ=dict(plan.environment))
     if "error" in spec:
-        raise SandboxUnavailable(str(spec.get("error")))
-    return replace(plan, argv=(spec["file"], *spec["args"]), commandLine=None)
+        raise SandboxUnavailable(spec["error"])
+    argv = (spec["file"], *spec["args"])
+    if plan.argv == argv and plan.commandLine is None:
+        return plan
+    return replace(plan, argv=argv, commandLine=None)

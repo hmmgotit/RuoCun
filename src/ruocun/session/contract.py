@@ -22,6 +22,7 @@ from ..platform.file_contract import (
 PRODUCT = "ruocun"
 FORMAT = "ruocun-session"
 STORAGE_VERSION = 3
+SHELL_LOG_FILES = ("stdout.log", "stderr.log", "stdout.txt", "stderr.txt")
 USER_VERSION = 1
 LEGACY_SESSION_USER_VERSION = 2
 
@@ -418,6 +419,12 @@ class StoragePort(Protocol):
     ) -> RunRecord:
         """在同一事务内关联已批准的 Bash 意图与唯一 runner 启动身份。"""
         ...
+
+    def retire_shell_history(self, owner: DbOwner, run_ref: RunRef, directory_identity: tuple[int, int]) -> None: ...
+
+    def pending_shell_retirements(self) -> dict[str, dict[str, Any]]: ...
+
+    def finish_shell_retirement(self, owner: DbOwner, run_id: str) -> None: ...
 
     def commit_shell_run(self, owner: DbOwner, run: RunRecord) -> None:
         """核对当前写入权后保存原执行及控制租约，工具结果已确认时直接复用。"""

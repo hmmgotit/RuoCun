@@ -629,7 +629,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                "TaskOutput读取子代理输出，TaskStop请求停止。"
                "进程取消请求与终态确认分开；其它扩展仅使用已注册工具及当前可见命令。"
                "工具按分层权限与有效模式裁决；plan限制普通文件写入和命令执行，记忆按其工具权限；auto分类失败转人工确认。"
-               "若存当前在Windows上不提供OS沙箱；macOS/Linux可选启用Shell沙箱，默认关闭，网络默认允许；实际限制按配置。请求的沙箱不可用时拒绝执行。"
+               "受管Shell始终使用系统沙箱；Windows使用MXC，macOS使用Seatbelt，Linux使用Bubblewrap。沙箱不可用时拒绝执行该次命令。"
                "支持静态Skills、文件访问发现、本地/Git安装、按需正文适配和上下文压缩。"
                "MemoryRead/MemoryWrite按需读写原生分域记忆；启动注入可关闭，维护不会改写本进程已选择的记忆前缀。"
                "摘要失败保留原上下文并停止本轮。其它未列工具只能通过当前文字交互请求用户决定。")
@@ -932,8 +932,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                 "contextUsed": session.lastPromptTokens or 0,
                 "contextWindow": context_manager.context_window, "costCNY": session.costCNY(),
                 "branch": _git_branch(cwd),
-                "backgroundRunning": bool(background and any(
-                    item.status in {"running", "canceling"} for item in background.snapshots())),
+                "backgroundRunning": bool(background and background.running()),
             }))
 
     def delta(value: StreamDelta) -> None:
@@ -1343,7 +1342,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
             signal.signal(signal.SIGTERM, interrupt)
         shell_manager = ManagedShellManager(sessions_root / selected, selected, conversation)
         ctx.managedShell = shell_manager
-        await shell_manager.restore(report_errors=True)
+        await shell_manager.restore(report_errors=True, retire_unsandboxed=True)
         background = BackgroundRuntime(store=conversation, workspaceRoot=cwd)
         await background.bind()
         shell_manager.bind_background(background)
@@ -1357,6 +1356,8 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                 await broker.start()
                 await broker.show_welcome(welcome(session.model))
             broker.on_escape = escape
+        if shell_manager.retirement_errors:
+            output(f"有 {len(shell_manager.retirement_errors)} 个旧无沙箱任务的材料待清理，将在恢复会话时重试。")
         if conversation.blocked:
             output("会话存在未决操作或缺失材料，已暂停模型执行。输入 /recovery 核对并明确处理，原操作不会自动重放。")
             if managed_deck:
@@ -1548,9 +1549,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         ctx.setMode = permissions.setMode
         ctx.approveExternalRead, ctx.approveExternalWrite = permissions.approveExternalRead, permissions.approveExternalWrite
         ctx.getShellPlan = permissions.getShellPlan
-        ctx.sandboxPolicy = permissions.sandboxPolicy
         ctx.authorizeSandboxShell = permissions.authorizeSandboxShell
-        ctx.approveSandboxWrite = permissions.approveSandboxWrite
         handoff = createAgentHandoff(classifier_context, call_classifier, output)
         ctx.runAgent = createAgentRunner(
             session, ctx, registry, permissions, conversation, options, env=env, project_instructions=project_text,

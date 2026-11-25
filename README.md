@@ -4,7 +4,7 @@
 
 **Coding Agent 工程参考实现**
 
-[![发布 v2.0.0](https://img.shields.io/badge/Release-v2.0.0-23604B)](https://github.com/hmmgotit/RuoCun/releases/tag/v2.0.0)
+[![发布 v2.1.0](https://img.shields.io/badge/Release-v2.1.0-23604B)](https://github.com/hmmgotit/RuoCun/releases/tag/v2.1.0)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](docs/install-and-recovery.md)
 [![Windows x64 安装包](https://img.shields.io/badge/Windows-x64-2563A8)](docs/install-and-recovery.md)
 [![MIT 许可证](https://img.shields.io/badge/License-MIT-596575)](LICENSE)
@@ -82,13 +82,15 @@ Terminal-Bench 2.1 是第三方基准，通过 Harbor 在独立容器中评测 A
 
 ## 快速开始
 
-当前发布包面向 **Windows x64 / CPython 3.11**。从 [v2.0.0 Release](https://github.com/hmmgotit/RuoCun/releases/tag/v2.0.0) 下载 wheel，在文件所在目录打开 PowerShell，安装到独立环境。
+当前 wheel 面向 **Windows x64 / CPython 3.11**。下载 wheel，在文件所在目录打开 PowerShell，安装到独立环境。[v2.1.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.1.0) · [v2.0.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.0.0)
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\ruocun-2.0.0-py311-none-win_amd64.whl
+.\.venv\Scripts\python.exe -m pip install .\ruocun-2.1.0-py311-none-win_amd64.whl
 .\.venv\Scripts\python.exe -m ruocun --cwd "C:\path\to\project"
 ```
+
+v2.1.0 的受管 Shell 始终启用系统沙箱。Windows 上的 Bash、Monitor 和子代理同类命令需要单独配置 Microsoft MXC v1.1.0 执行器。执行器缺失或宿主无法应用隔离时，该次命令会被拒绝，聊天和历史会话查看仍可用。[Windows MXC 安装配置](docs/windows-sandbox.md)
 
 第一次启动时，终端引导会设置模型服务、API 密钥和工作目录信任。想知道一条用户请求怎样经过模型、工具和结果回流，可以直接读[第 1 章的一次查价案例](https://hmmgotit.github.io/RuoCun/learning/revised/task-loop.html)。
 

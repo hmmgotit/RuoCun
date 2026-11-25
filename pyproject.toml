@@ -38,6 +38,7 @@ markers = [
   "live: real model access and explicit budget required",
   "terminal: visible Windows Terminal and final human acceptance required",
   "install: explicit isolated installation suite",
+  "native_mxc: exercises the native Windows MXC workload and requires the pinned executor and a supported host",
 ]
 
 [tool.ruff]

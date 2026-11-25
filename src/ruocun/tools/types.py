@@ -19,7 +19,6 @@ if TYPE_CHECKING:
     from ..hooks.hooks import HookRuntime
     from ..lsp.manager import LspManager
     from ..memory.memory_audit import MemoryAuditSink
-    from ..platform.sandbox_policy import SandboxPolicy
     from ..platform.shell_plan import ShellExecutionPlan
     from ..session.cache_audit import CacheAuditSink
     from .agent import AgentRequest
@@ -91,9 +90,7 @@ class ToolContext:
     rollbackTaskWait: Callable[[], None] | None = None
     onShellOutput: Callable[[Literal["stdout", "stderr"], str], None] | None = None
     getShellPlan: Callable[[str, str], ShellExecutionPlan] | None = None
-    sandboxPolicy: SandboxPolicy | None = None
     authorizeSandboxShell: Callable[[ShellExecutionPlan, list[str]], Awaitable[ShellExecutionPlan]] | None = None
-    approveSandboxWrite: Callable[[str], Awaitable[bool]] | None = None
     searchTools: Callable[[str], str] | None = None
     onFileAccessed: Callable[[str], None] | None = None
     onSkillsInstalled: Callable[[Literal["user", "project"]], None] | None = None

@@ -12,7 +12,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
-from ..platform.sandbox_policy import createSandboxPolicy
 from .types import ToolContext, ToolRejected
 
 
@@ -66,29 +65,12 @@ async def approvedPath(ctx: ToolContext, p: str, *, write: bool = False) -> str:
     absolute, external = await asyncio.to_thread(classifyPath, ctx.cwd or ctx.workspaceRoot, p)
     if ctx.signal.is_set():
         raise InterruptedError("工具调用已取消")
-    policy = ctx.sandboxPolicy
-    if write and policy is None:
-        try:
-            policy = createSandboxPolicy(ctx.workspaceRoot)
-        except ValueError as error:
-            raise ToolRejected("沙箱写入策略不可用，未执行写入。") from error
-        if policy is not None:
-            ctx.sandboxPolicy = policy
-    if write and policy is not None:
-        original = os.path.abspath(os.path.join(ctx.cwd or ctx.workspaceRoot, p))
-        # 原始路径和解析后的目标都要检查，以免经由别名绕过受保护目录。
-        if policy.isProtected(original) or policy.isProtected(absolute):
-            raise ToolRejected(f"Error: {p} 属于沙箱受保护路径，未授权写入。")
-        if not policy.allowsWrite(absolute):
-            if ctx.approveSandboxWrite is None or not await ctx.approveSandboxWrite(absolute):
-                raise ToolRejected(f"Error: {p} 不在沙箱写入范围内，未获本次授权。")
-        if ctx.signal.is_set():
-            raise InterruptedError("工具调用已取消")
-        return absolute
     if external:
         approve = ctx.approveExternalWrite if write else ctx.approveExternalRead
         if approve is None or not await approve(absolute):
             raise ToolRejected(f"Error: {p} 在工作区之外,未获授权访问。")
+    if ctx.signal.is_set():
+        raise InterruptedError("工具调用已取消")
     return absolute
 
 

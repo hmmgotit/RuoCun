@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shutil
@@ -14,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from ..platform.process_tree import run_foreground_plan
+from ..platform.process_tree import ShellLaunchRejected, run_foreground_plan
 from ..platform.sandbox import SandboxUnavailable, sandboxExecutionPlan
 from ..platform.sandbox_policy import SandboxPolicy
 from ..platform.shell_plan import buildShellPlan
@@ -95,20 +94,14 @@ def _spill_output(content: str, cwd: str, *, workspace_only: bool = False, polic
     )
 
 
-def _check(raw: str) -> Literal["ask"] | None:
-    try:
-        args = json.loads(raw)
-    except ValueError:
-        return None
-    return "ask" if isinstance(args, dict) and args.get("dangerouslyDisableSandbox") is True else None
-
-
 async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     global _pythonInlineStreak, _pythonInlineNudged
     background = bool(args.get("background"))
     unsupported = set(args) - {"command", "description", "background", "dangerouslyDisableSandbox", "additionalWriteDirectories"}
     if unsupported:
         return "首版不支持这些Bash参数；命令未执行：" + ", ".join(sorted(unsupported))
+    if args.get("dangerouslyDisableSandbox") is True:
+        raise ToolRejected("受管 Shell 不能整次绕过系统沙箱，命令未执行。")
     command = args["command"]
     execution_signal = ctx.signal
     if execution_signal.is_set():
@@ -137,25 +130,20 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
         _pythonInlineStreak, _pythonInlineNudged = 0, False
     plan = ctx.getShellPlan(command, cwd) if ctx.getShellPlan is not None else buildShellPlan(command, cwd, analyze=False)
     plan = await prepareSandboxPlan(plan, ctx, args.get("additionalWriteDirectories"))
-    if plan.sandbox is not None and args.get("dangerouslyDisableSandbox") is True:
-        raise ToolRejected("Windows 沙箱已开启，不能整次绕过；请请求本次额外可写目录。")
-    # 单次绕过仅限前台命令，后台继续按既定执行边界运行。
-    disable_sandbox = not background and args.get("dangerouslyDisableSandbox") is True
     try:
-        execution_plan = sandboxExecutionPlan(plan, disable_sandbox)
+        execution_plan = sandboxExecutionPlan(plan)
     except SandboxUnavailable as error:
         raise ToolRejected(str(error)) from error
     if background and ctx.managedShell is None:
         return "首版不支持 background=true；命令未执行。请使用前台执行。"
     if background and os.name != "nt":
         raise ToolRejected("当前环境未提供可恢复Shell执行后端，命令未执行。")
-    sandboxed = execution_plan is not plan
     # 备份由宿主程序写入，子进程沙箱的路径限制在此处也需显式检查。
-    backup_notice = _backup_databases(command, plan.cwd, workspace_only=sandboxed, policy=plan.sandbox)
+    backup_notice = _backup_databases(command, plan.cwd, workspace_only=True, policy=execution_plan.sandbox)
     output_callback = ctx.onShellOutput
     if ctx.managedShell is not None and (os.name == "nt" or background):
-        managed = await ctx.managedShell.execute(plan, execution_signal, background=background,
-                                                 onOutput=output_callback, disableSandbox=disable_sandbox)
+        managed = await ctx.managedShell.execute(execution_plan, execution_signal, background=background,
+                                                 onOutput=output_callback)
         if isinstance(managed, str):
             return (backup_notice + "\n" if backup_notice else "") + managed
         result = managed
@@ -185,9 +173,9 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
             execution_signal.set()
             await execution  # 等待真正的进程树退出后，再结束本地等待。
             raise
+        except ShellLaunchRejected as error:
+            raise ToolRejected(str(error)) from error
         except FileNotFoundError as error:
-            if execution_plan is plan:
-                raise
             raise ToolRejected("沙箱启动文件或工作目录不可用，命令未执行。") from error
     ctx.pendingUnverifiedWrites.clear()
     if ctx.headless and ctx.todoWriteRequired is not None and (
@@ -215,7 +203,7 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     if result.aborted and re.search(r"(?:^|[\s;&|])(apt-get|apt|dpkg|aptitude)(?=\s|$|;|&|\|)", command):
         # 恢复包管理器会再次写入系统，先提示用户单独批准恢复命令。
         parts.append("[需恢复] 包管理器命令被中断；继续前请审批并执行 dpkg --configure -a 检查修复状态。")
-    content = _spill_output("\n".join(parts), plan.cwd, workspace_only=sandboxed, policy=plan.sandbox)
+    content = _spill_output("\n".join(parts), plan.cwd, workspace_only=True, policy=execution_plan.sandbox)
     return ShellToolOutput(content, failed=result.aborted or result.code != 0)
 
 
@@ -226,8 +214,8 @@ execShellTool = Tool(
         "PowerShell/pwsh/Bash须显式调用，按实际方言审批；非Windows使用/bin/sh。"
         "没有超时，Ctrl+C停止当前前台受管树；已绑定可恢复后端时支持background=true及同run转后台。"
         "Shell退出后遗留的受管子孙也会停止。查询内容用Grep、查路径用Glob、读文件用Read。"
-        "系统沙箱默认关闭；RUOCUN_SANDBOX=1 时Windows使用固定独立Codex CLI/MXC，macOS/Linux沿用原生后端。"
-        "Windows开启后失败即报错且不能整次绕过；additionalWriteDirectories仅请求本次目录，仍需用户明确批准。"
+        "受管命令必须在系统沙箱内运行；沙箱不可用时拒绝执行。"
+        "Windows 可用 additionalWriteDirectories 请求本次额外写目录，需用户逐次批准。"
     ),
     schema={
         "type": "object",
@@ -235,12 +223,11 @@ execShellTool = Tool(
             "command": {"type": "string", "description": "要执行的Shell命令；Windows默认cmd，其他解释器显式调用"},
             "description": {"type": "string", "description": "命令的语义描述（用于审计日志）"},
             "background": {"type": "boolean", "description": "true启动为可重连后台Shell，默认false"},
-            "dangerouslyDisableSandbox": {"type": "boolean", "description": "Windows沙箱开启时禁止；其它后端仅本次前台绕过并强制审批"},
             "additionalWriteDirectories": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 8,
                                            "description": "请求本次额外可写的绝对目录；需逐次用户批准，不代表已获授权"},
         },
         "required": ["command"],
         "additionalProperties": False,
     },
-    capability="exec", checkPermissions=_check, handler=_handler,
+    capability="exec", handler=_handler,
 )

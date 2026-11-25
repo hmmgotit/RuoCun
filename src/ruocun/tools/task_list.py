@@ -24,7 +24,7 @@ DESCRIPTION_EN = (
 
 
 _ICON = {
-    "interrupted": "已中断", "unknown": "待核实", "canceling": "取消中", "running": "▶",
+    "interrupted": "已中断", "unknown": "待核实", "launching": "待启动", "canceling": "取消中", "running": "▶",
     "completed": "☑", "failed": "✗", "canceled": "☐",
 }
 

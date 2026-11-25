@@ -16,11 +16,14 @@ from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 import ruocun
 from ruocun.agent.runtime_context import isRuntimeContext
 from ruocun.platform.windows.durable_file import ensure_private_dir
 
 
+@pytest.mark.native_mxc
 def test_seven_tools_approval_and_normal_reopen(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -168,7 +171,7 @@ def test_seven_tools_approval_and_normal_reopen(tmp_path):
         "model": "glm-5.3-flash", "key": "synthetic-key",
     }}}), encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k in {
-        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP",
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "RUOCUN_MXC_EXEC",
     }}
     env.update(HOME=str(home), USERPROFILE=str(home), APPDATA=str(home), LOCALAPPDATA=str(home),
                ProgramData=str(home / "program-data"), PYTHONNOUSERSITE="1", PIP_CONFIG_FILE="NUL",

@@ -578,6 +578,15 @@ class Conversation:
         safe = replace(record, snapshot=self._safe(record.snapshot))
         await self.worker.enqueue_shell_run(safe).wait()
 
+    async def retire_shell_history(self, run_ref: RunRef, directory_identity: tuple[int, int]) -> None:
+        await self.worker.enqueue_shell_retirement(run_ref, directory_identity).wait()
+
+    async def pending_shell_retirements(self) -> dict[str, dict[str, Any]]:
+        return await self.worker.pending_shell_retirements()
+
+    async def finish_shell_retirement(self, run_id: str) -> None:
+        await self.worker.enqueue_finish_shell_retirement(run_id).wait()
+
     async def recover(self) -> tuple[RunRecord, ...]:
         view = await self.worker.load_recovery_view()
         tools = {record.tool_ref: record for record in view.tool_records}

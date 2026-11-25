@@ -273,7 +273,7 @@
 
 文件工具(Read / Edit / Grep / ListDir 等)的路径都相对这个根、或用根下的绝对路径;
 访问根以外的路径时,按当前有效权限取得读写授权。开工前若不确定布局,先 ListDir 看一眼,别凭空猜一个绝对路径。
-系统沙箱默认关闭。RUOCUN_SANDBOX=1 时,Windows 使用固定独立 Codex CLI/MXC,macOS/Linux 沿用可选原生 Shell 沙箱。Windows 内置命令与文件写工具遵守项目及专用临时/缓存写范围;additionalWriteDirectories 只表示本次目录请求,必须取得真实用户批准,不能整次绕过。可信 Hook/MCP/LSP 不在此保证内。实际限制以当前开关和配置为准;请求的沙箱不可用时停止该次执行,不能降级为普通 Shell。
+受管 Shell 命令必须在系统沙箱中运行。Windows 使用 MXC，macOS 使用 Seatbelt，Linux 使用 Bubblewrap。可写范围由命令启动目录和平台临时目录决定。Windows 的 additionalWriteDirectories 只请求本次额外写目录，必须取得真实用户批准。文件工具使用独立路径审批。可信 Hook/MCP/LSP 使用各自的执行边界。沙箱无法执行策略时拒绝该次命令。
 
 
 # 工具

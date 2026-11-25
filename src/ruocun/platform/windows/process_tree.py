@@ -72,6 +72,7 @@ def run_managed(
     argv: list[str], cwd: str, env: dict[str, str], signal: threading.Event, cap: int,
     *, commandLine: str | None = None, onChunk: Callable[[int, bytes], None] | None = None,
     captureOutput: bool = True, stdinData: bytes | None = None, perStreamLimit: bool = False,
+    stdoutFilter: Callable[[bytes], bytes] | None = None,
 ) -> tuple[bytes, bytes, int, bool, bool]:
     """返回 stdout、stderr、退出码和取消、超量状态，执行异常继续向上抛出。"""
     import msvcrt
@@ -135,6 +136,10 @@ def run_managed(
         try:
             with os.fdopen(fd, "rb", buffering=0) as stream:
                 while chunk := stream.read(65536):
+                    if index == 0 and stdoutFilter is not None:
+                        chunk = stdoutFilter(chunk)
+                        if not chunk:
+                            continue
                     with lock:
                         used = len(output[index]) if perStreamLimit else len(output[0]) + len(output[1])
                         remaining = cap - used if captureOutput else len(chunk)

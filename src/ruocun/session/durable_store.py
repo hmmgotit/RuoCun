@@ -17,12 +17,14 @@ from typing import TYPE_CHECKING, Any, Callable, TypeVar
 from ..platform.windows.durable_file import (
     PrivateDirectory,
     atomic_publish,
+    local_path,
     verify_private_file,
 )
 from .contract import (
     FORMAT,
     LEGACY_SESSION_USER_VERSION,
     PRODUCT,
+    SHELL_LOG_FILES,
     STORAGE_VERSION,
     USER_VERSION,
     AcceptedInput,
@@ -357,6 +359,22 @@ def _all_tools(con: "sqlite3.Connection") -> list[ToolRecord]:
         _decode_tool_record(_loads(row[0]))
         for row in con.execute("SELECT json FROM tools").fetchall()
     ]
+
+
+def _references_shell_output(tool: ToolRecord, run_ref: RunRef) -> bool:
+    """关联已提交的读日志工具与原任务，不依赖工具结果的展示格式。"""
+    if tool.state != "result_committed" or tool.name not in {"BashOutput", "TaskWait"}:
+        return False
+    try:
+        args = _loads(tool.args)
+    except ValueError:
+        return False
+    if not isinstance(args, dict):
+        return False
+    if tool.name == "BashOutput":
+        return args.get("id") == run_ref.run_id
+    ids = args.get("ids")
+    return isinstance(ids, list) and (run_ref.task_id in ids or run_ref.run_id in ids)
 
 
 def _all_runs(con: "sqlite3.Connection") -> list[RunRecord]:
@@ -995,6 +1013,60 @@ class DurableStore:
     def commit_shell_run(self, owner: DbOwner, run: RunRecord) -> None:
         self._atomic(owner, lambda con: self._save_shell_run(con, run))
 
+    def retire_shell_history(self, owner: DbOwner, run_ref: RunRef, directory_identity: tuple[int, int]) -> None:
+        def body(con: "sqlite3.Connection") -> None:
+            pending = _read_meta(con, "shell_retirements") or {}
+            run = _read_run(con, run_ref)
+            if run is None and run_ref.run_id in pending:
+                return
+            if (run is None or run.run_ref != run_ref or run.kind != "shell"
+                    or run.status not in {"completed", "failed", "canceled"}
+                    or run.snapshot.get("retire_unsandboxed") is not True
+                    or run.snapshot.get("closed") is not True or not run.snapshot.get("receipt_digest")):
+                raise StoreError("旧Shell没有可信关闭收据，保留运行历史。")
+            ref = ToolRef(**run.snapshot["tool_ref"])
+            tool = _read_tool(con, ref)
+            if (tool is None or tool.state != "result_committed" or tool.intent is None
+                    or tool.intent.run_ref != run_ref):
+                raise StoreError("旧Shell的工具结果尚未保存，保留运行历史。")
+
+            # 已登记附件和已返回给对话的日志目录继续由会话保有。
+            directory = Path(run.snapshot["run_dir"])
+            retained = {Path(file).name for file in (_read_meta(con, "attachments") or {})
+                        if local_path(Path(file).parent) == directory}
+            if any(_references_shell_output(previous, run_ref) for previous in _all_tools(con)):
+                retained.update(SHELL_LOG_FILES)
+            pending[run_ref.run_id] = {"directory_identity": directory_identity, "retained": sorted(retained)}
+            _put_meta(con, "shell_retirements", pending)
+
+            # 只删除属于这条执行的通知，已经进入对话的消息照常保留。
+            events = [row[0] for row in con.execute("SELECT id,json FROM events")
+                      if _loads(row[1]).get("run_ref") == asdict(run_ref)]
+            con.executemany("DELETE FROM events WHERE id=?", ((event_id,) for event_id in events))
+            checkpoint = _read_meta(con, "checkpoint")
+            if checkpoint is not None:
+                background = checkpoint.get("background") or {}
+                wait = background.get("wait")
+                if wait is not None:
+                    targets = [target for target in wait["targets"] if target["runId"] != run_ref.run_id]
+                    if len(targets) != len(wait["targets"]):
+                        background["wait"] = {**wait, "targets": targets} if targets else None
+                        _put_meta(con, "checkpoint", checkpoint)
+            con.execute("DELETE FROM runs WHERE id=?", (run_ref.run_id,))
+
+        self._atomic(owner, body)
+
+    def pending_shell_retirements(self) -> dict[str, dict[str, Any]]:
+        return _read_meta(self._require_con(), "shell_retirements") or {}
+
+    def finish_shell_retirement(self, owner: DbOwner, run_id: str) -> None:
+        def body(con: "sqlite3.Connection") -> None:
+            pending = _read_meta(con, "shell_retirements") or {}
+            if pending.pop(run_id, None) is not None:
+                _put_meta(con, "shell_retirements", pending)
+
+        self._atomic(owner, body)
+
     @staticmethod
     def _is_task_description_update(prior: RunRecord, updated: RunRecord) -> bool:
         previous = prior.snapshot.get("background_execution")
@@ -1157,12 +1229,16 @@ class DurableStore:
                 or not isinstance(data.get("cwd"), str)):
             raise StoreError("监控执行与已批准参数不符。")
         if prior is None:
-            if run.status != "running" or parent.state != "started" or run.cancel_requested:
+            if run.status != "launching" or parent.state != "started" or run.cancel_requested or data.get("startedAt") is not None:
                 raise StoreError("监控首次登记状态无效。")
         else:
-            fixed = ("monitor_epoch", "parent_tool_ref", "command", "cwd", "persistent", "timeout_ms", "startedAt")
+            fixed = ("monitor_epoch", "parent_tool_ref", "command", "cwd", "persistent", "timeout_ms")
+            confirming = prior.status == "launching" and run.status == "running"
             if (any(prior.snapshot.get(key) != data.get(key) for key in fixed)
                     or prior.cancel_requested and not run.cancel_requested
+                    or prior.status != "launching" and run.status == "launching"
+                    or confirming and (parent.state != "result_committed" or type(data.get("startedAt")) is not int)
+                    or not confirming and prior.snapshot.get("startedAt") != data.get("startedAt")
                     or prior.status in {"canceling", "unknown", "interrupted"} and run.status == "running"):
                 raise StoreError("监控执行身份或取消状态发生冲突。")
 
@@ -1325,7 +1401,7 @@ class DurableStore:
                 if record.state == "started":
                     _put_tool(con, replace(record, state="outcome_unknown"))
             for run in _all_runs(con):
-                if run.kind in {"agent", "fork", "monitor"} and run.status in {"running", "canceling"}:
+                if run.kind in {"agent", "fork", "monitor"} and run.status in {"launching", "running", "canceling"}:
                     parent = unresolved_children.get(run.run_ref.run_id)
                     unknown = (run.kind in {"agent", "fork"} and parent is not None
                                and run.snapshot.get("parent_tool_ref") == asdict(parent))

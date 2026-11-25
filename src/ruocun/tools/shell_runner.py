@@ -16,7 +16,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, cast
 
-from ..platform.process_tree import ForegroundResult, run_foreground_plan
+from ..platform.process_tree import (
+    ForegroundResult,
+    ShellLaunchRejected,
+    run_foreground_plan,
+)
 from ..platform.shell_plan import ShellAnalysis, ShellExecutionPlan
 from ..platform.windows.durable_file import (
     AtomicPublishPreReplaceError,
@@ -27,6 +31,8 @@ from ..platform.windows.durable_file import (
     sync_directory,
     verify_private_file,
 )
+from ..platform.windows.sandbox import windowsSandboxWaitsForWorkload
+from ..session.contract import SHELL_LOG_FILES as LOGS
 from ..session.contract import ProcessIdentity
 from ..session.process_identity import identity_alive, process_identity
 from ..version import __version__
@@ -36,7 +42,6 @@ if TYPE_CHECKING:
 
 PROTOCOL_VERSION = 1
 TERMINAL = {"completed", "failed", "canceled"}
-LOGS = ("stdout.log", "stderr.log", "stdout.txt", "stderr.txt")
 
 
 def canonical(value: Any) -> bytes:
@@ -95,7 +100,8 @@ def package_files() -> dict[str, str]:
     root = Path(__file__).resolve().parents[1]
     names = ("tools/shell_runner.py", "platform/process_tree.py", "platform/windows/process_tree.py",
              "platform/windows/ipc.py", "platform/shell_output.py", "platform/sandbox.py",
-             "platform/sandbox_policy.py", "platform/windows/sandbox.py", "platform/shell_plan.py", "version.py")
+             "platform/sandbox_policy.py", "platform/windows/sandbox.py", "platform/windows/mxc_bridge.py",
+             "platform/shell_plan.py", "version.py")
     return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
 
 
@@ -161,6 +167,12 @@ def validate_terminal(receipt: dict[str, Any], manifest: dict[str, Any], directo
         raise ValueError("runner终态退出码无效。")
     if (receipt["status"] == "completed" and code != 0) or (receipt["status"] == "failed" and code == 0):
         raise ValueError("runner终态与退出码冲突。")
+    if receipt["status"] != "canceled" and windowsSandboxWaitsForWorkload(parse_plan(manifest["plan"])):
+        if receipt.get("launch_rejected") is True:
+            if receipt["status"] != "failed" or receipt.get("started") is not False:
+                raise ValueError("runner启动拒绝收据状态冲突。")
+        elif receipt.get("started") is not True:
+            raise ValueError("runner终态缺少实际命令启动确认。")
 
 
 class Runner:
@@ -244,12 +256,14 @@ class Runner:
                 raise OSError("runner解码输出写入未完成。")
             view = view[count:]
 
-    def finish(self, result: ForegroundResult) -> None:
+    def finish(self, result: ForegroundResult, *, launch_rejected: bool = False) -> None:
         self.close_logs()
         if any(note.startswith("实时输出回调不可用") for note in result.decodingDiagnostics):
             raise RuntimeError("runner解码日志未能完整保存。")
         with self.lock:
             status = "canceled" if result.aborted else "completed" if result.code == 0 else "failed"
+            if launch_rejected:
+                self.state["launch_rejected"] = True
             self.state.update(status=status, phase="terminal", closed=True, code=result.code,
                               elapsed_ms=result.elapsedMs, decoding_diagnostics=list(result.decodingDiagnostics),
                               logs=log_facts(self.directory))
@@ -259,9 +273,17 @@ class Runner:
 
     def execute(self) -> None:
         try:
-            result = run_foreground_plan(self.plan, self.stop, onLogOutput=self.text_output,
-                                         onRawOutput=self.raw_output, captureOutput=False)
-            self.finish(result)
+            try:
+                result = run_foreground_plan(self.plan, self.stop, onLogOutput=self.text_output,
+                                             onRawOutput=self.raw_output, captureOutput=False,
+                                             onStarted=self.confirm_start)
+            except ShellLaunchRejected as error:
+                diagnostic = f"{error}\n"
+                self.text_output("stderr", diagnostic)
+                self.raw_output(1, diagnostic.encode("utf-8"))
+                self.finish(ForegroundResult("", diagnostic, 1, False, 0), launch_rejected=True)
+            else:
+                self.finish(result)
         except BaseException as error:
             try:
                 self.close_logs()
@@ -275,8 +297,16 @@ class Runner:
                     pass
             self.done.set()
 
+    def confirm_start(self) -> None:
+        with self.lock:
+            confirmed = {**self.state, "started": True}
+            if not self.stop.is_set():
+                confirmed.update(phase="started", status="running")
+            write_signed(self.directory / "runner-state.json", confirmed, self.capability)
+            self.state = confirmed
+
     def start(self) -> None:
-        if self.state["started"] or self.done.is_set():
+        if self.worker is not None or self.state["started"] or self.done.is_set():
             return
         grant = read_signed(self.directory / "grant.json", self.capability)
         for name in ("version", "session_id", "task_id", "run_id", "launch_id", "plan_digest", "control_epoch", "owner_identity"):
@@ -292,11 +322,18 @@ class Runner:
             os.fsync(data.fileno())
         verify_private_file(claim)
         sync_directory(self.directory)
-        self.state.update(started=True, phase="started", status="running")
+        if windowsSandboxWaitsForWorkload(self.plan):
+            self.state.update(phase="start-claimed", status="launching")
+        else:
+            self.state.update(started=True, phase="started", status="running")
         self.persist()
         worker = threading.Thread(target=self.execute, name="ruocun-shell-executor")
-        worker.start()
         self.worker = worker
+        try:
+            worker.start()
+        except BaseException:
+            self.worker = None
+            raise
 
     def control(self, payload: dict[str, Any], owner: ProcessIdentity) -> dict[str, Any]:
         with self.lock:
@@ -338,7 +375,7 @@ class Runner:
                         self.persist()
                     finally:
                         self.stop.set()
-                if not self.state["started"] and not self.done.is_set():
+                if self.worker is None and not self.done.is_set():
                     self.finish(ForegroundResult("", "", 1, True, 0))
             elif action == "detach":
                 self.state["detached"] = True
@@ -387,8 +424,9 @@ class Runner:
                             pass
                     if not self.state["started"] and (self.stop.is_set() or time.monotonic() >= deadline):
                         self.stop.set()
-                        self.finish(ForegroundResult("", "", 1, True, 0))
-                        break
+                        if self.worker is None:
+                            self.finish(ForegroundResult("", "", 1, True, 0))
+                            break
                     if self.server is not None and not self.server.alive and not self.transport_poisoned:
                         try:
                             self.server.close()

@@ -293,6 +293,7 @@ def test_source_assistant_reasoning_fields_survive_tool_followup():
     assert assistant["responseItems"] == first.message["responseItems"]
 
 
+@pytest.mark.native_mxc
 def test_failed_exec_skips_later_effects_in_same_batch(tmp_path):
     # 保留来源对同批停止写入、继续读取的断言，使用实际 Shell 退出状态。
     (tmp_path / "input.txt").write_text("read still runs", encoding="utf-8")

@@ -116,7 +116,7 @@ LSP从用户/项目lsp.json配置servers(command/args/extensions)，按需启动
 /audit [memory|reflect|tools|perms|cache|skills] 查看脱敏本地审计；可选远端trace与本地日志分开记录。
 观测失败不改变业务结果，关闭时不导入可选SDK；LMNR_BASE_URL/HTTP_PORT/PROJECT_API_KEY配置HTTP出口。
 Deck 外部面板通过本机回环协议查看并控制同一会话。
-OS 沙箱默认关闭；RUOCUN_SANDBOX=1 时 Windows 使用独立固定 Codex CLI 0.169.0/MXC（RUOCUN_SANDBOX_CLI 指定绝对路径），Linux/macOS 沿用原生后端。开启后失败即报错，不回退普通执行；Windows 禁止整次绕过，额外写目录须逐次用户批准。评估模式和权限审批各自独立。
+受管 Shell 必须使用系统沙箱。Windows 使用微软 MXC 执行器（RUOCUN_MXC_EXEC 可指定固定版本的绝对路径），Linux 使用 Bubblewrap，macOS 使用 Seatbelt。后端不可用时拒绝该次命令。Windows 额外写目录须逐次用户批准。评估模式与工具权限审批各自独立。
 完整真实终端的最终体验验收仍单独记录。
 环境开关使用 RUOCUN_ 前缀。MAX_BUDGET默认提醒，MAX_BUDGET_HARD=1才硬停；
 MAX_TURNS可设回合工具轮数上限；默认不限制。失败后已确认工具不会自动重放。

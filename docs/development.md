@@ -1,6 +1,6 @@
 # 开发与构建
 
-v2.0.0 的发布目标是 Windows x64 和 CPython 3.11。程序入口在 `src/ruocun/cli.py`，版本由 `src/ruocun/version.py` 提供。项目按 Hatchling 配置生成 wheel 和源码包。
+v2.1.0 的 wheel 面向 Windows x64 和 CPython 3.11。程序入口在 `src/ruocun/cli.py`，版本由 `src/ruocun/version.py` 提供。项目按 Hatchling 配置生成 wheel 和源码包。
 
 ## 安装开发依赖
 
@@ -20,7 +20,7 @@ $devPy = (Resolve-Path .venv/Scripts/python.exe).Path
 
 ```powershell
 & $bootPy -I -X utf8 tools/run.py --label build-package --wheelhouse .cache/wheels -- $devPy -I -X utf8 -m build
-$wheel = (Resolve-Path dist/ruocun-2.0.0-py311-none-win_amd64.whl).Path
+$wheel = (Resolve-Path dist/ruocun-2.1.0-py311-none-win_amd64.whl).Path
 & $bootPy -I -X utf8 tools/run.py --label install-product --wheelhouse .cache/wheels -- $devPy -I -X utf8 -m pip install --no-deps --force-reinstall $wheel
 & $bootPy -I -X utf8 tools/run.py --label check-wheel -- $devPy -I -X utf8 -m pip check
 $testTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('ruocun-tests-' + [guid]::NewGuid())
@@ -29,4 +29,4 @@ $testTemp = Join-Path ([System.IO.Path]::GetTempPath()) ('ruocun-tests-' + [guid
 
 公开测试使用已安装的 wheel，覆盖入口、模型请求构造、工具循环、文件编辑、上下文压缩与归档、记忆读写和 SQLite 会话等。少量请求测试使用本机环回的合成服务。接入真实模型请参考[安装与恢复](install-and-recovery.md)。
 
-构建完成后，`dist/` 内有 `ruocun-2.0.0-py311-none-win_amd64.whl` 和 `ruocun-2.0.0.tar.gz`。命令输出收在 `.cache/engineering/raw/<label>/stdout.bin` 和 `stderr.bin`，退出状态在同目录的 `command.json`。
+构建完成后，`dist/` 内有 `ruocun-2.1.0-py311-none-win_amd64.whl` 和 `ruocun-2.1.0.tar.gz`。命令输出收在 `.cache/engineering/raw/<label>/stdout.bin` 和 `stderr.bin`，退出状态在同目录的 `command.json`。

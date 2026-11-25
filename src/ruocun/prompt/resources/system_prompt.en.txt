@@ -283,7 +283,7 @@ Concise, to the point. You're talking to an engineer in a terminal, not writing 
 
 Paths for file tools (Read / Edit / Grep / ListDir etc.) are relative to this root, or use absolute paths under it.
 Access outside the root requires authorization under the effective read/write permissions. If unsure of the layout before starting, ListDir first; don't guess an absolute path out of thin air.
-OS sandboxing is disabled by default. With RUOCUN_SANDBOX=1, Windows uses a pinned independent Codex CLI/MXC; macOS/Linux retain their optional native Shell backends. On Windows, built-in commands and file writes follow the project and dedicated temporary/cache write scope. additionalWriteDirectories only requests this execution's extra directories and requires actual user approval; a whole-sandbox bypass is forbidden. Trusted Hooks/MCP/LSP are outside this guarantee. Effective restrictions depend on the current switch and configuration. If a requested sandbox is unavailable, stop that execution instead of falling back to an ordinary Shell.
+Managed Shell commands require the operating system sandbox: MXC on Windows, Seatbelt on macOS, and Bubblewrap on Linux. Write access is based on the command's starting directory and platform temporary directories. On Windows, additionalWriteDirectories requests additional paths for one command and requires actual user approval. File tools apply their own path approval rules. Trusted Hooks/MCP/LSP have separate execution boundaries. Reject the command if the sandbox cannot enforce its policy.
 
 
 # Tools

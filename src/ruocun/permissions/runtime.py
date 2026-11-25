@@ -130,7 +130,8 @@ class PermissionRuntime:
     ) -> None:
         self.cwd, self.session, self._tiers = cwd, session, tiers
         source_env = dict(executionEnv if executionEnv is not None else os.environ)
-        self.sandboxPolicy = sandboxPolicy if sandboxPolicy is not None else createSandboxPolicy(cwd, source_env)
+        # Shell 策略按命令的实际启动目录准备，沙箱不可用时仍可使用会话。
+        self.sandboxPolicy = sandboxPolicy
         self._executionEnv = (sandboxEnvironment(source_env, self.sandboxPolicy) if self.sandboxPolicy is not None
                               else dict(executionEnv) if executionEnv is not None else None)
         self.localSettingsFile = cwd / ".ruocun" / "settings.local.json"
@@ -352,8 +353,10 @@ class PermissionRuntime:
                     raise ValueError("Shell command must be a string")
                 if command not in plans:
                     prepared_plan = await prepareShellPlan(command, str(executionCwd or self.cwd), environ=self._executionEnv)
-                    plans[command] = (replace(prepared_plan, sandbox=self.sandboxPolicy)
-                                      if self.sandboxPolicy is not None else prepared_plan)
+                    policy = self.sandboxPolicy
+                    if policy is not None and tuple(map(_canonical, policy.writableRoots)) != (_canonical(prepared_plan.cwd),):
+                        policy = replace(policy, writableRoots=(_canonical(prepared_plan.cwd),))
+                    plans[command] = replace(prepared_plan, sandbox=policy) if policy is not None else prepared_plan
         self._shellPlans.set(MappingProxyType(plans))
         self._approvedShellPlans.set(MappingProxyType({}))
         for call in calls:
@@ -362,7 +365,7 @@ class PermissionRuntime:
             command = shell_args.get("command")
             plan = plans.get(command) if isinstance(command, str) else None
             sandbox_bypass = tool.name == "Bash" and shell_args.get("dangerouslyDisableSandbox") is True
-            if sandbox_bypass and self.sandboxPolicy is not None:
+            if sandbox_bypass:
                 decisions[call.call_id] = False
                 continue
             if plan is not None and tool.name == "Bash":
@@ -382,7 +385,7 @@ class PermissionRuntime:
             hook = call.hook_decision
             if hook == "deny":
                 decision = "deny"
-            elif (hook == "ask" or sandbox_bypass) and decision != "deny":
+            elif hook == "ask" and decision != "deny":
                 decision = "ask"
                 force_human.add(call.call_id)
             if decision != "ask":
@@ -391,18 +394,16 @@ class PermissionRuntime:
             dangerous = isDangerousCall(tool.name, raw)
             if plan is not None:
                 dangerous = dangerous or self._dangerousShell(plan)
-            sensitive = isSensitiveCall(tool.name, raw) or dangerous or sandbox_bypass
+            sensitive = isSensitiveCall(tool.name, raw) or dangerous
             if hook == "allow" and not sensitive and (plan is None or plan.analysis.known):
                 decisions[call.call_id] = True
                 continue
             summary = plan.summary() if plan is not None else _describe(tool.name, raw)
-            if sandbox_bypass:
-                summary = "请求本次绕过沙箱\n" + summary
             requests.append({
                 "id": call.call_id, "toolName": tool.name, "capability": tool.capability,
                 "summary": redactSecrets(self._redact(summary)), "argsJson": raw,
                 "sensitive": sensitive,
-                "dangerous": dangerous, "noPersist": (sandbox_bypass or rememberRule(tool.name, raw) is None
+                "dangerous": dangerous, "noPersist": (rememberRule(tool.name, raw) is None
                     or plan is not None and (not plan.analysis.known or bool(plan.analysis.wrappers))),
             })
         asked = {request["id"] for request in requests}
@@ -441,8 +442,6 @@ class PermissionRuntime:
         return (await self.authorizeBatch([BatchCall("tool", tool, rawArgs)]))["tool"]
 
     async def _approveExternal(self, absolute: str, *, write: bool) -> bool:
-        if write and self.sandboxPolicy is not None:
-            return await self.approveSandboxWrite(absolute)
         grants = self._callGrants.get()
         once = (grants.write if write else grants.read) if grants is not None else None
         key = _canonical(absolute)
@@ -479,47 +478,16 @@ class PermissionRuntime:
     async def approveExternalWrite(self, absolute: str) -> bool:
         return await self._approveExternal(absolute, write=True)
 
-    async def approveSandboxWrite(self, absolute: str) -> bool:
-        """临时授权绑定规范化的写入目标，仅本次工具调用有效。"""
-        policy = self.sandboxPolicy
-        if policy is None:
-            return await self._approveExternal(absolute, write=True)
-        if self.getMode() == "plan" or not os.path.isabs(absolute) or "\0" in absolute:
-            return False
-        if policy.isProtected(absolute):
-            return False
-        if policy.allowsWrite(absolute):
-            return True
-        key = _canonical(absolute)
-        grants = self._callGrants.get()
-        if grants is not None and key in grants.write:
-            return True
-        if not self._interactive:
-            return False
-        request: ApprovalRequest = {
-            "id": "sandbox-file-write", "toolName": "沙箱外写入（仅本次）", "capability": "write",
-            "summary": redactSecrets(self._redact("仅本次允许文件工具写入：\n请求路径：" + absolute + "\n实际目标：" + key)),
-            "sensitive": True, "noPersist": True,
-        }
-        decision = (await self._prompt([request])).get(request["id"], "deny")
-        if decision != "once" or _canonical(absolute) != key or policy.isProtected(absolute):
-            return False
-        if grants is not None:
-            grants.write.add(key)
-        return True
-
     async def authorizeSandboxShell(self, plan: ShellExecutionPlan, requested_roots: list[str]) -> ShellExecutionPlan:
         """把人工批准的额外根目录绑定到本次执行，命令缓存不持有这些授权。"""
-        policy = self.sandboxPolicy
-        if policy is None:
-            if requested_roots:
-                raise ToolRejected("当前未启用写入沙箱，不能请求沙箱额外写入目录。")
-            return plan
-        if plan.sandbox != policy:
-            raise ToolRejected("Shell执行计划的基本沙箱策略不匹配，命令未执行。")
         if not requested_roots:
             return plan
         approved = self.getShellPlan(plan.command, plan.cwd)
+        policy = approved.sandbox or createSandboxPolicy(approved.cwd, dict(approved.environment))
+        if policy is None:
+            raise ToolRejected("额外写入目录仅适用于 Windows 沙箱。")
+        if plan.sandbox != policy:
+            raise ToolRejected("Shell执行计划的基本沙箱策略不匹配，命令未执行。")
         expected = replace(approved, sandbox=policy,
                            environment=tuple(sorted(sandboxEnvironment(dict(approved.environment), policy).items())))
         if plan != expected:

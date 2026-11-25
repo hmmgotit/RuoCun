@@ -10,6 +10,7 @@ import codecs
 import hashlib
 import os
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -31,7 +32,7 @@ from ..platform.windows.durable_file import (
     local_path,
     verify_private_file,
 )
-from ..session.contract import RunRecord, RunRef
+from ..session.contract import SHELL_LOG_FILES, RunRecord, RunRef
 from ..session.process_identity import identity_alive, process_identity
 from ..version import __version__
 from .shell_runner import (
@@ -40,6 +41,7 @@ from .shell_runner import (
     digest,
     identity,
     package_files,
+    parse_plan,
     plan_payload,
     read_signed,
     validate_manifest,
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T")
 _READ_LIMIT = 16000
+_RUN_FILES = (*SHELL_LOG_FILES, "runner.log", "runner-state.json", "manifest.json", "terminal.json",
+              "grant.json", "start.claim", "cancel.json", "capability")
 _STREAMS: tuple[Literal["stdout", "stderr"], ...] = ("stdout", "stderr")
 
 
@@ -60,6 +64,9 @@ class ShellRunStore(Protocol):
     async def prepare(self, run_ref: RunRef, snapshot: dict[str, Any]) -> RunRecord: ...
     async def commit(self, record: RunRecord) -> None: ...
     async def recover(self) -> tuple[RunRecord, ...]: ...
+    async def retire_shell_history(self, run_ref: RunRef, directory_identity: tuple[int, int]) -> None: ...
+    async def pending_shell_retirements(self) -> dict[str, dict[str, Any]]: ...
+    async def finish_shell_retirement(self, run_id: str) -> None: ...
 
 
 @dataclass
@@ -97,6 +104,7 @@ class ManagedShellManager:
         self._closed = False
         self._background: BackgroundRuntime | None = None
         self.recovery_errors: dict[str, str] = {}
+        self.retirement_errors: dict[str, str] = {}
         self._recovery_unconfirmed = False
 
     @asynccontextmanager
@@ -185,8 +193,11 @@ class ManagedShellManager:
             "phase": "terminal", "receipt_digest": hashlib.sha256((entry.directory / "terminal.json").read_bytes()).hexdigest(),
             "runner_identity": receipt["runner_identity"], "code": receipt.get("code"), "closed": True,
         }
-        if recover and "tool_result" not in entry.record.snapshot:
-            metadata["tool_result"] = self._recovery_ack(entry.record.run_ref.run_id)
+        if "tool_result" not in entry.record.snapshot:
+            if entry.record.snapshot.get("retire_unsandboxed") is True:
+                metadata["tool_result"] = "旧无沙箱命令已退出，未重新执行。"
+            elif recover:
+                metadata["tool_result"] = self._recovery_ack(entry.record.run_ref.run_id)
         await self._commit(entry, status=receipt["status"], **metadata)
 
     @staticmethod
@@ -240,31 +251,56 @@ class ManagedShellManager:
                                detached=bool(reply.get("detached", False)))
         return reply
 
+    async def _recover_start_status(self, entry: _Run) -> dict[str, Any]:
+        # 负载可能已结束并先于回包发布签名收据。重连时只查同一个运行。
+        receipt = await self._port(self._terminal, entry)
+        if receipt is not None:
+            await self._accept_terminal(entry, receipt)
+            return receipt
+        return await self._connect(entry)
+
+    async def _wait_for_start(
+        self, entry: _Run, response: dict[str, Any], signal: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + 30
+        while (response.get("phase") == "start-claimed" and response.get("status") == "launching"
+               or response.get("status") == "canceling"):
+            expired = time.monotonic() >= deadline
+            if (expired or (signal is not None and signal.is_set())) and not entry.record.cancel_requested:
+                await self.cancel(entry.record.run_ref.run_id)
+            if entry.terminal is not None:
+                return entry.terminal
+            if expired:
+                raise RuntimeError("原Shell的启动结果未确认，拒绝重新启动。")
+            await asyncio.sleep(.05)
+            try:
+                response = await self._rpc(entry, "status")
+            except (OSError, ValueError, RuntimeError):
+                response = await self._recover_start_status(entry)
+        return response
+
+    async def _accept_start_terminal(self, entry: _Run) -> None:
+        if entry.terminal is not None:
+            return
+        receipt = await self._port(self._terminal, entry)
+        if receipt is None:
+            raise RuntimeError("原Shell报告终态但缺少可信收据。")
+        await self._accept_terminal(entry, receipt)
+
     async def _confirm_start(self, entry: _Run, signal: threading.Event) -> None:
-        """发出启动请求。回包无法确认时，只核实原运行的状态。"""
+        """只发一次启动请求。启动器认领后等待实际负载确认。"""
         try:
             response = await self._rpc(entry, "start")
-            if response.get("started") is not True:
-                raise RuntimeError("runner未确认启动认领，不重复执行。")
-            if response.get("status") != "running":
-                raise RuntimeError("runner启动后状态需要核验。")
         except (OSError, ValueError, RuntimeError):
-            # 短命令可能已经结束并写出收据。先检查原运行的签名收据。
-            receipt = await self._port(self._terminal, entry)
-            if receipt is not None:
-                await self._accept_terminal(entry, receipt)
-                return
-            if signal.is_set():
-                # 已收到取消且没有查到收据，交由外层启动流程继续收尾。
-                raise
-            # 没有终态收据，还可以通过认证通道核实原 runner 的身份和状态。
-            # 重连会记录确认后的状态，或在进程刚结束时接收终态收据。
-            response = await self._connect(entry)
-            if entry.terminal is not None or (response.get("started") is True and response.get("status") == "running"):
-                return  # 核实结果已经由 _connect 持久化。
-            # 原运行仍无法确认已开始或已结束，由外层保留未确认状态。
-            raise
-        await self._commit(entry, status="running", phase="started")
+            response = await self._recover_start_status(entry)
+        response = await self._wait_for_start(entry, response, signal)
+        if response.get("status") in TERMINAL:
+            await self._accept_start_terminal(entry)
+        elif response.get("started") is True and response.get("status") == "running":
+            if entry.record.status != "running":
+                await self._commit(entry, status="running", phase="started")
+        else:
+            raise RuntimeError("原Shell未能确认实际负载启动，拒绝重新执行。")
 
     def _create_files(self, entry: _Run) -> None:
         runs = self.directory / "runs"
@@ -683,10 +719,14 @@ class ManagedShellManager:
         onOutput: OutputCallback | None = None, disableSandbox: bool = False,
     ) -> ForegroundResult | str:
         try:
-            plan = sandboxExecutionPlan(plan, disableSandbox and not background)
+            plan = sandboxExecutionPlan(plan, disableSandbox)
         except SandboxUnavailable as error:
             raise ToolRejected(str(error)) from error
         entry = await self._start(plan, signal)
+        if entry.terminal is not None and entry.terminal.get("started") is False:
+            if entry.terminal.get("launch_rejected") is True:
+                raise ToolRejected("Windows MXC 拒绝启动原始 Shell 进程，命令未执行。")
+            raise ToolRejected("实际Shell命令尚未启动，沙箱执行器已退出。")
         run_id = entry.record.run_ref.run_id
         if background:
             await self.detach(run_id)
@@ -763,7 +803,86 @@ class ManagedShellManager:
             if self._foreground == run_id:
                 self._foreground = None
 
-    async def restore(self, *, report_errors: bool = False) -> tuple[RunRecord, ...]:
+    @staticmethod
+    def _legacy_direct_shell(entry: _Run) -> bool:
+        plan = parse_plan(entry.manifest["plan"])
+        return (
+            plan.sandbox is None and plan.dialect == "cmd"
+            and Path(plan.argv[0]).name.casefold() == "cmd.exe"
+            and plan.argv[1:] == ("/d", "/s", "/c", plan.command)
+            and plan.commandLine == f'"{plan.argv[0]}" /d /s /c "{plan.command}"'
+        )
+
+    @staticmethod
+    def _run_directory_identity(path: Path) -> tuple[int, int]:
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError("旧Shell运行目录不是可核验的普通目录。")
+        return info.st_dev, info.st_ino
+
+    def _remove_retired_files(self, run_id: str, pending: dict[str, Any]) -> None:
+        if str(uuid.UUID(run_id)) != run_id:
+            raise ValueError("旧Shell的运行标识无效。")
+        directory = local_path(self.directory / "runs" / run_id)
+        expected = tuple(pending["directory_identity"])
+        try:
+            actual = self._run_directory_identity(directory)
+        except FileNotFoundError:
+            return
+        if actual != expected:
+            raise ValueError("旧Shell的运行目录已更换，保留现场。")
+        with PrivateDirectory(directory):
+            if self._run_directory_identity(directory) != expected:
+                raise ValueError("旧Shell的运行目录已更换，保留现场。")
+            removable = [directory / name for name in _RUN_FILES if name not in pending["retained"]]
+            for path in removable:
+                try:
+                    verify_private_file(path)
+                except FileNotFoundError:
+                    continue
+                path.unlink()
+        # 已归档的文件和无法证明归属的文件仍留在原址。
+        if not any(directory.iterdir()) and self._run_directory_identity(directory) == expected:
+            directory.rmdir()
+
+    async def _complete_retired_files(self) -> None:
+        for run_id, pending in (await self.store.pending_shell_retirements()).items():
+            try:
+                await self._port(self._remove_retired_files, run_id, pending)
+                await self.store.finish_shell_retirement(run_id)
+            except (OSError, ValueError, RuntimeError) as error:
+                self.retirement_errors[run_id] = type(error).__name__
+            else:
+                self.retirement_errors.pop(run_id, None)
+
+    async def _retire_live_shell(self, entry: _Run) -> None:
+        run_id = entry.record.run_ref.run_id
+        if entry.record.snapshot.get("retire_unsandboxed") is not True:
+            await self._commit(entry, retire_unsandboxed=True)
+        await self.cancel(run_id)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            receipt = await self._port(self._terminal, entry)
+            if receipt is not None:
+                await self._accept_terminal(entry, receipt)
+                return
+            await asyncio.sleep(.1)
+        raise RuntimeError("原无沙箱Shell的退出未确认，保留运行历史。")
+
+    async def _purge_retired_shell(self, entry: _Run) -> None:
+        deadline = time.monotonic() + 15
+        runner = identity(entry.record.snapshot["runner_identity"])
+        while identity_alive(runner):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("原无沙箱Shell的执行器仍在退出，暂缓清理运行历史。")
+            await asyncio.sleep(.05)
+        directory_identity = await self._port(self._run_directory_identity, entry.directory)
+        await self.store.retire_shell_history(entry.record.run_ref, directory_identity)
+        self._runs.pop(entry.record.run_ref.run_id, None)
+
+    async def restore(
+        self, *, report_errors: bool = False, retire_unsandboxed: bool = False,
+    ) -> tuple[RunRecord, ...]:
         for record in await self.store.recover():
             if record.snapshot.get("storage_link_version") != 1:
                 continue
@@ -774,6 +893,7 @@ class ManagedShellManager:
             if record.status == "failed-before-grant":
                 self._runs[record.run_ref.run_id] = _Run(record, {}, b"")
                 continue
+            entry: _Run | None = None
             if (record.snapshot.get("phase") in {"intent", "bootstrap"}
                     and not (directory / "grant.json").exists() and not (directory / "start.claim").exists()):
                 entry = _Run(record, {}, b"")
@@ -798,10 +918,24 @@ class ManagedShellManager:
                 receipt = await self._port(self._terminal, entry)
                 if receipt is not None:
                     await self._accept_terminal(entry, receipt, recover=True)
+                    if retire_unsandboxed and record.snapshot.get("retire_unsandboxed") is True:
+                        await self._purge_retired_shell(entry)
                     continue
                 state = await self._connect(entry, adopt=True)
+                if state.get("started") is not True:
+                    state = await self._wait_for_start(entry, state)
+                if state["status"] in TERMINAL:
+                    await self._accept_start_terminal(entry)
+                    if retire_unsandboxed and record.snapshot.get("retire_unsandboxed") is True:
+                        await self._purge_retired_shell(entry)
+                    continue
                 if not state.get("started"):
                     raise RuntimeError("runner未完成启动认领，恢复不重发start。")
+                if (retire_unsandboxed and state["status"] in {"running", "canceling"}
+                        and self._legacy_direct_shell(entry)):
+                    await self._retire_live_shell(entry)
+                    await self._purge_retired_shell(entry)
+                    continue
                 if not entry.record.snapshot.get("detached"):
                     await self.cancel(record.run_ref.run_id)
                     deadline = time.monotonic() + 15
@@ -821,6 +955,10 @@ class ManagedShellManager:
                     metadata["tool_result"] = self._recovery_ack(record.run_ref.run_id)
                 await self._commit(entry, status=state["status"], **metadata)
             except (OSError, ValueError, RuntimeError) as error:
+                if (entry is not None and entry.record.status in TERMINAL
+                        and entry.record.snapshot.get("retire_unsandboxed") is True):
+                    self.retirement_errors[record.run_ref.run_id] = type(error).__name__
+                    continue
                 if record.status in TERMINAL:
                     if report_errors:
                         self.recovery_errors[record.run_ref.run_id] = type(error).__name__
@@ -830,6 +968,8 @@ class ManagedShellManager:
                 if record.run_ref.run_id not in self._runs:
                     self._runs[record.run_ref.run_id] = _Run(record, {}, b"")
                 await self._unknown(self._runs[record.run_ref.run_id], error)
+        if retire_unsandboxed:
+            await self._complete_retired_files()
         return tuple(entry.record for entry in self._runs.values())
 
     async def _close_bootstrap(self, entry: _Run, launcher: subprocess.Popen[bytes]) -> None:

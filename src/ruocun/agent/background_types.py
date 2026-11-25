@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 ExecutionStatus = Literal[
-    "running", "canceling", "completed", "failed", "canceled", "interrupted", "unknown"
+    "launching", "running", "canceling", "completed", "failed", "canceled", "interrupted", "unknown"
 ]
 EventType = Literal[
     "started",

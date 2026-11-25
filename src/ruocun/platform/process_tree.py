@@ -28,6 +28,14 @@ OutputCallback = Callable[[Literal["stdout", "stderr"], str], None]
 ChunkCallback = Callable[[int, bytes], None]
 
 
+class ShellLaunchUnconfirmed(RuntimeError):
+    """沙箱没有确认原始命令进程已创建。"""
+
+
+class ShellLaunchRejected(RuntimeError):
+    """可信后端证据表明原始命令未启动。"""
+
+
 @dataclass(frozen=True)
 class ForegroundResult:
     stdout: str
@@ -135,6 +143,7 @@ def run_foreground_argv(
     commandLine: str | None = None, codec: str = "utf-8", onOutput: OutputCallback | None = None,
     decodeClixml: bool = False, onRawOutput: ChunkCallback | None = None, captureOutput: bool = True,
     onLogOutput: OutputCallback | None = None, stdinData: bytes | None = None, outputLimit: int | None = None,
+    stdoutFilter: Callable[[bytes], bytes] | None = None,
 ) -> ForegroundResult:
     """用已解析的可执行文件绝对路径和参数启动受控前台进程树。"""
     start = time.monotonic()
@@ -175,7 +184,7 @@ def run_foreground_argv(
 
         stdout, stderr, code, aborted, capped = run_managed(
             argv, cwd, env, signal, cap, commandLine=commandLine, onChunk=chunk, captureOutput=captureOutput,
-            stdinData=stdinData, perStreamLimit=outputLimit is not None,
+            stdinData=stdinData, perStreamLimit=outputLimit is not None, stdoutFilter=stdoutFilter,
         )
     else:
         stdout, stderr, code, aborted, capped = _run_posix(
@@ -205,11 +214,66 @@ def run_foreground_argv(
 
 def run_foreground_plan(plan: "ShellExecutionPlan", signal: threading.Event, *, onOutput: OutputCallback | None = None,
                         onRawOutput: ChunkCallback | None = None, captureOutput: bool = True,
-                        onLogOutput: OutputCallback | None = None) -> ForegroundResult:
+                        onLogOutput: OutputCallback | None = None,
+                        onStarted: Callable[[], None] | None = None) -> ForegroundResult:
     from .shell_plan import _words
     words = _words(plan.command) or []
     powershell = {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}
     decode_clixml = bool(words and Path(words[0]).name.casefold() in powershell) or any(
         Path(wrapper.partition("\n")[0]).name.casefold() in powershell for wrapper in plan.analysis.wrappers)
-    return run_foreground_argv(list(plan.argv), plan.cwd, signal, environ=dict(plan.environment),
-                               commandLine=plan.commandLine, codec=plan.codec, onOutput=onOutput, decodeClixml=decode_clixml, onRawOutput=onRawOutput, captureOutput=captureOutput, onLogOutput=onLogOutput)
+    markers = None
+    confirmed = rejected = False
+    if os.name == "nt":
+        from .file_contract import AtomicFileError
+        from .windows.sandbox import (
+            WindowsSandboxError,
+            discardWindowsSandboxRequest,
+            probeWindowsSandboxRequest,
+            windowsSandboxLaunchMarkers,
+        )
+
+        try:
+            markers = windowsSandboxLaunchMarkers(plan)
+            if markers is not None and not signal.is_set():
+                probeWindowsSandboxRequest(plan)
+        except (OSError, AtomicFileError, WindowsSandboxError) as error:
+            if markers is not None:
+                discardWindowsSandboxRequest(plan)
+            raise ShellLaunchRejected("MXC 无法准备或应用沙箱策略，命令未执行。") from error
+    received = bytearray()
+
+    def accept_start(chunk: bytes) -> bytes:
+        nonlocal confirmed, rejected
+        assert markers is not None
+        started_marker, refused_marker = markers
+        if confirmed:
+            return chunk
+        needed = len(started_marker) - len(received)
+        received.extend(chunk[:needed])
+        if not any(marker.startswith(received) for marker in markers):
+            raise ShellLaunchUnconfirmed("MXC 启动确认不匹配，原命令执行结果未确认。")
+        if len(received) != len(started_marker):
+            return b""
+        if received == refused_marker:
+            if chunk[needed:]:
+                raise ShellLaunchUnconfirmed("MXC 拒绝帧与后续输出冲突，原命令执行结果未确认。")
+            rejected = True
+            return b""
+        confirmed = True
+        if onStarted is not None:
+            onStarted()
+        return chunk[needed:]
+
+    result = run_foreground_argv(
+        list(plan.argv), plan.cwd, signal, environ=dict(plan.environment), commandLine=plan.commandLine,
+        codec=plan.codec, onOutput=onOutput, decodeClixml=decode_clixml, onRawOutput=onRawOutput,
+        captureOutput=captureOutput, onLogOutput=onLogOutput, stdoutFilter=accept_start if markers is not None else None,
+    )
+    if markers is not None and not (confirmed or rejected or result.aborted):
+        raise ShellLaunchUnconfirmed(f"MXC 执行器退出（exit={result.code}），原命令启动未确认。")
+    if markers is not None:
+        from .windows.sandbox import discardWindowsSandboxRequest
+        discardWindowsSandboxRequest(plan)
+    if rejected and not result.aborted:
+        raise ShellLaunchRejected("MXC 内无法创建原始 Shell 进程，命令未执行。")
+    return result
