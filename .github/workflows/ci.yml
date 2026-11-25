@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   windows:
-    name: Windows x64 CPython 3.11 installed gate
+    name: Windows Server 2022 package and clean install
     runs-on: windows-2022
     timeout-minutes: 35
     steps:
@@ -27,35 +27,14 @@ jobs:
         with:
           python-version: '3.11.9'
           architecture: x64
-      - name: Lint, type check, build, install and test
-        shell: pwsh
-        run: .github/ci/windows_hosted.ps1
-      - name: Report failed installed test names
-        if: failure()
-        shell: pwsh
-        run: |
-          try {
-            [xml]$report = Get-Content -Raw -LiteralPath '.cache/ci/windows-junit.xml' -ErrorAction Stop
-            $failures = @($report.SelectNodes('/testsuites/testsuite/testcase[failure or error]'))
-          } catch {
-            Write-Host 'No readable pytest result was produced. See the failed command label above.'
-            exit 0
-          }
-          Write-Host "Installed pytest reported $($failures.Count) failing or errored cases."
-          foreach ($case in $failures) {
-            $module = $case.GetAttribute('classname')
-            $test = $case.GetAttribute('name').Split('[', 2)[0]
-            if ($module -cmatch '^[A-Za-z_][A-Za-z0-9_.]*\z' -and $test -cmatch '^test_[A-Za-z0-9_]+\z') {
-              Write-Host "Failed: ${module}::${test}"
-            }
-          }
+      - name: Build and verify a clean wheel install
+        run: python -I -X utf8 .github/ci/windows_gate.py --stage package --state .cache/ci
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: windows-quality-receipts
           path: |
             .cache/ci/raw/
-            .cache/ci/windows-junit.xml
             .cache/ci/SHA256SUMS
           include-hidden-files: true
 
