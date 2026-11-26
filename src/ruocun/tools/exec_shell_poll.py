@@ -6,6 +6,7 @@ import time
 from importlib.resources import files
 from typing import Any
 
+from .sandbox import shellSandboxLabel
 from .schema import objectSchema
 from .types import Tool, ToolContext
 
@@ -20,18 +21,23 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     run_id = args["id"]
     result = await ctx.managedShell.poll(run_id)
     status, stdout, stderr = result["status"], result["stdout"], result["stderr"]
+    mode = shellSandboxLabel(result.get("sandboxEnabled"), ctx.lang)
     if status == "running" and not stdout.strip() and not stderr.strip():
         now = time.monotonic()
         previous = _lastPollAt.get(run_id, float("-inf"))
         _lastPollAt[run_id] = now
         if now - previous < 30:
-            return ("No output since the recent check. Wait for the completion notification."
-                    if ctx.lang == "en" else "刚才的查询之后没有新输出，请等待完成通知。")
-        return ("The command is still running. The session will report completion."
-                if ctx.lang == "en" else "命令还在运行，会话会报告最终结果。")
+            notice = ("No output since the recent check. Wait for the completion notification."
+                      if ctx.lang == "en" else "刚才的查询之后没有新输出，请等待完成通知。")
+        else:
+            notice = ("The command is still running. The session will report completion."
+                      if ctx.lang == "en" else "命令还在运行，会话会报告最终结果。")
+        return f"{notice} [{mode}]"
     _lastPollAt.pop(run_id, None)
     displayed = "exited" if status in {"completed", "failed", "canceled"} else status
     parts = [f"Status: {displayed}" if ctx.lang == "en" else f"状态:{displayed}"]
+    if status != "not-found":
+        parts[0] += f" · {mode}"
     if stdout.strip():
         parts.append(stdout.rstrip())
     if stderr.strip():

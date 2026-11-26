@@ -117,6 +117,7 @@ class _MonitorExecution:
     record: RunRecord
     plan: ShellExecutionPlan
     signal: Event
+    sandbox_enabled: bool
     executor: asyncio.Task[None] | None = None
 
 
@@ -266,7 +267,7 @@ class TaskManager:
                 task.error = safe
 
     async def launch_monitor(self, plan: ShellExecutionPlan, description: str, *, timeout_ms: int | None,
-                             parent: ToolRef, parent_signal: Event) -> BgTask:
+                             parent: ToolRef, parent_signal: Event, sandbox_enabled: bool) -> BgTask:
         async with self._lock:
             if self._closed or self.conversation.blocked or parent_signal.is_set():
                 raise ToolRejected("当前会话不能启动监控，命令未执行。")
@@ -277,7 +278,7 @@ class TaskManager:
                 "monitor_epoch": self.conversation.owner_epoch, "parent_tool_ref": asdict(parent), "description": safe,
                 "command": plan.command, "cwd": plan.cwd, "timeout_ms": timeout_ms, "persistent": timeout_ms is None,
             })
-            execution = _MonitorExecution(task, record, plan, threading.Event())
+            execution = _MonitorExecution(task, record, plan, threading.Event(), sandbox_enabled)
             await self._publish_monitor(execution, "launching")
             self._monitors[ref.run_id] = execution
             self._tasks[task.id] = task
@@ -311,7 +312,8 @@ class TaskManager:
                         break
                     await asyncio.sleep(.05)
             result = await runMonitor(execution.plan, task.description, execution.signal,
-                                      timeout_ms=execution.record.snapshot["timeout_ms"], emit=emit, onStarted=confirm_start)
+                                      timeout_ms=execution.record.snapshot["timeout_ms"], emit=emit,
+                                      onStarted=confirm_start, sandbox_enabled=execution.sandbox_enabled)
             status: ExecutionStatus = "canceled" if task.status == "canceling" else "completed"
         except (SandboxUnavailable, ShellLaunchRejected) as error:
             status, result = "failed", str(error)

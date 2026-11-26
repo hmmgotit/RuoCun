@@ -145,7 +145,7 @@ def test_bash_returns_known_rejection_when_mxc_cannot_apply_its_request(backend,
         return subprocess.CompletedProcess(argv, 1)
 
     monkeypatch.setattr(subprocess, "run", refuse_probe)
-    ctx = ToolContext(original.cwd, getShellPlan=lambda *_: original)
+    ctx = ToolContext(original.cwd, getShellPlan=lambda *_: original, sandboxEnabled=True)
     with pytest.raises(ToolRejected, match="MXC.*命令未执行"):
         asyncio.run(execShellTool.handler({"command": original.command}, ctx))
 

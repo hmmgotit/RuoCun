@@ -7,11 +7,10 @@ from typing import Any, Literal
 
 from ..permissions.bash_safety import isDangerousCommand
 from ..permissions.sanitize import hasSuspiciousUnicode
-from ..platform.sandbox import SandboxUnavailable, sandboxExecutionPlan
 from ..platform.shell_plan import buildShellPlan
-from .sandbox import prepareSandboxPlan
+from .sandbox import prepareShellExecutionPlan
 from .schema import objectSchema
-from .types import Tool, ToolContext, ToolRejected
+from .types import Tool, ToolContext
 
 DESCRIPTION = (
     "运行后台命令，主动把标准输出的每行作为通知送回；短时间内的多行会合并。一次性条件达成后应让命令自行退出。默认 5 分钟超时，可调整 timeout_ms；持续监控用 "
@@ -44,15 +43,12 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
         return "当前环境不支持任务追踪,monitor 需要它才能推送通知。"
     cwd, command = ctx.cwd or ctx.workspaceRoot, args["command"]
     plan = ctx.getShellPlan(command, cwd) if ctx.getShellPlan is not None else buildShellPlan(command, cwd, analyze=False)
-    plan = await prepareSandboxPlan(plan, ctx, args.get("additionalWriteDirectories"))
-    try:
-        plan = sandboxExecutionPlan(plan)
-    except SandboxUnavailable as error:
-        raise ToolRejected(str(error)) from error
+    plan = await prepareShellExecutionPlan(plan, ctx, args.get("additionalWriteDirectories"))
     timeout = None if args.get("persistent", False) else args.get("timeout_ms", 300000)
     task = await manager.launch_monitor(plan, args["description"], timeout_ms=timeout,
-                                        parent=manager.conversation.current_agent_parent(), parent_signal=ctx.signal)
-    return (f"已登记监控(task id={task.id})，等待沙箱启动：{task.description}。"
+                                        parent=manager.conversation.current_agent_parent(), parent_signal=ctx.signal,
+                                        sandbox_enabled=ctx.sandboxEnabled)
+    return (f"已登记监控(task id={task.id})，等待命令启动：{task.description}。"
             "命令输出会按行批量推送。想提前结束用 TaskStop。")
 
 
@@ -66,6 +62,6 @@ monitorTool = Tool(
         "timeout_ms": {"type": "integer", "minimum": 1000, "maximum": 3600000,
                        "description": "超时后自动终止(毫秒),默认 300000;persistent:true 时忽略"},
         "additionalWriteDirectories": {"type": "array", "items": {"type": "string", "minLength": 1}, "maxItems": 8,
-                                       "description": "请求本次额外可写的绝对目录，仍需逐次用户批准"},
+                                       "description": "Windows 沙箱开启时可请求本次额外可写的绝对目录，需用户批准"},
     }, ["command", "description"]),
 )

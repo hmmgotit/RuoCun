@@ -283,7 +283,7 @@ Concise, to the point. You're talking to an engineer in a terminal, not writing 
 
 Paths for file tools (Read / Edit / Grep / ListDir etc.) are relative to this root, or use absolute paths under it.
 Access outside the root requires authorization under the effective read/write permissions. If unsure of the layout before starting, ListDir first; don't guess an absolute path out of thin air.
-Managed Shell commands require the operating system sandbox: MXC on Windows, Seatbelt on macOS, and Bubblewrap on Linux. Write access is based on the command's starting directory and platform temporary directories. On Windows, additionalWriteDirectories requests additional paths for one command and requires actual user approval. File tools apply their own path approval rules. Trusted Hooks/MCP/LSP have separate execution boundaries. Reject the command if the sandbox cannot enforce its policy.
+Managed Shell system sandbox for this run: {shell_sandbox_status}. Shell commands still require permission checks when sandboxing is disabled. When enabled, Windows uses MXC, macOS uses Seatbelt, and Linux uses Bubblewrap. Write access is based on the command's starting directory and platform temporary directories. Windows sandbox additionalWriteDirectories requests additional paths for one command and requires actual user approval. The command is rejected if the sandbox cannot enforce its policy. File tools apply their own path approval rules. Trusted Hooks/MCP/LSP have separate execution boundaries.
 
 
 # Tools

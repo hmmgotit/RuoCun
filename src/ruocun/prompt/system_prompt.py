@@ -168,7 +168,10 @@ def buildSystemPrompt(opts: dict[str, Any]) -> str:
     unknown = "(unknown)" if is_en else "(未知)"
     none_yet = "(none yet)" if is_en else "(暂无)"
     tag_example = " `[反思]`/" if mem_on else " "
+    sandbox_enabled = opts.get("sandboxEnabled", False)
+    sandbox_status = ("Enabled" if sandbox_enabled else "Disabled") if is_en else ("开启" if sandbox_enabled else "关闭")
     replacements: dict[str, str] = {
+        "{shell_sandbox_status}": sandbox_status,
         "{model_id}": model_id,
         "{model_vision_note}": _vision_note(model_id, False),
         "{model_vision_note_en}": _vision_note(model_id, True),

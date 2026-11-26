@@ -1,6 +1,7 @@
 """Check the source adapters on POSIX without claiming a POSIX product install."""
 
 import ast
+import asyncio
 import os
 import sys
 import threading
@@ -17,8 +18,10 @@ def main() -> int:
     from ruocun import __version__
     from ruocun.cli import main as cli
     from ruocun.platform.process_tree import run_foreground_plan
-    from ruocun.platform.sandbox import sandboxExecutionPlan, sandboxSpawn
+    from ruocun.platform.sandbox import sandboxSpawn
     from ruocun.platform.shell_plan import buildShellPlan
+    from ruocun.tools.sandbox import prepareShellExecutionPlan
+    from ruocun.tools.types import ToolContext
 
     assert sys.platform in {"linux", "darwin"} and sys.version_info[:2] >= (3, 11)
     paths = sorted((SOURCE / "ruocun").rglob("*.py"))
@@ -33,10 +36,12 @@ def main() -> int:
         value = "合成 POSIX 🙂"
         plan = buildShellPlan("printf '%s\\n' \"$SYNTHETIC_VALUE\"", tmp,
                               environ={"HOME": tmp, "PATH": "/usr/bin:/bin", "SYNTHETIC_VALUE": value})
-        result = run_foreground_plan(plan, threading.Event())
+        execution = asyncio.run(prepareShellExecutionPlan(plan, ToolContext(tmp)))
+        assert execution is plan
+        result = run_foreground_plan(execution, threading.Event())
         assert result.code == 0 and result.stdout == value + "\n" and not result.stderr
         selected = sandboxSpawn("ls", tmp, platform=sys.platform, exists=lambda _: True,
-                                environ={"RUOCUN_SANDBOX": "1", "RUOCUN_SANDBOX_NO_NET": "1"})
+                                environ={"RUOCUN_SANDBOX_NO_NET": "1"})
         assert selected and "file" in selected and selected["args"][-3:] == ["/bin/sh", "-c", "ls"]
         expected = "--unshare-net" if sys.platform == "linux" else "(deny network*)"
         assert expected in " ".join(selected["args"])
@@ -47,7 +52,9 @@ def main() -> int:
             workspace.mkdir()
             command = "printf inside > accepted.txt; if (printf outside > ../blocked.txt) 2>/dev/null; then exit 1; fi"
             plan = buildShellPlan(command, str(workspace), environ={"HOME": tmp, "PATH": "/usr/bin:/bin"})
-            result = run_foreground_plan(sandboxExecutionPlan(plan), threading.Event())
+            context = ToolContext(str(workspace), sandboxEnabled=True)
+            execution = asyncio.run(prepareShellExecutionPlan(plan, context))
+            result = run_foreground_plan(execution, threading.Event())
             assert result.code == 0 and (workspace / "accepted.txt").read_text() == "inside"
             assert not (root / "blocked.txt").exists()
         print("Seatbelt permitted workspace writes and denied the outside write.")

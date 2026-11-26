@@ -1,4 +1,4 @@
-"""Upgrade retirement through a real synthetic Windows runner and durable session."""
+"""Recover old unsandboxed Windows runs with their original runner and history."""
 import sys
 
 import pytest
@@ -7,9 +7,9 @@ from test_n15_managed_shell import _CODE, _run_case
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows 可恢复受管 Shell")
 
 
-_RETIRE = _CODE[:_CODE.index("async def scenario():")] + r"""
+_KEEP = _CODE[:_CODE.index("async def scenario():")] + r"""
 import hashlib
-from unittest.mock import patch
+from dataclasses import replace
 
 async def scenario():
     def controller(store):
@@ -20,12 +20,11 @@ async def scenario():
     manager=controller(store)
     try:
         script=root/'worker.py'
-        script.write_text("from pathlib import Path\nimport time\np=Path('ticks');i=0\nwhile True:\n p.write_text(str(i));print(i,flush=True);i+=1;time.sleep(.02)\n",encoding='utf-8')
-        command=f'"{sys.executable}" -I "{script}"'
+        script.write_text("from pathlib import Path\nimport time\nwith Path('starts').open('a') as starts: starts.write('once')\np=Path('ticks');i=0\nwhile True:\n p.write_text(str(i));print(i,flush=True);i+=1;time.sleep(.02)\n",encoding='utf-8')
+        command=f'"{sys.executable}" -I "{script}" synthetic-key'
         await store.intent('legacy','Bash',json.dumps({'command':command}),True)
-        # Produce the old, directly launched Windows plan with the normal runner protocol.
-        with patch('ruocun.tools.managed_shell.sandboxExecutionPlan', lambda plan, _: plan):
-            ack=await manager.execute(buildShellPlan(command,str(root)),threading.Event(),background=True)
+        ack=await manager.execute(buildShellPlan(command,str(root)),threading.Event(),
+                                  background=True,sandbox_enabled=False)
         session.messages.extend([
             {'role':'assistant','content':'','tool_calls':[{'id':'legacy','type':'function',
               'function':{'name':'Bash','arguments':json.dumps({'command':command})}}]},
@@ -50,6 +49,16 @@ async def scenario():
             ])
         await store.save(session)
         assert 'legacy' == record.snapshot['tool_ref']['tool_call_id']
+        retirement_intent=(root/'retirement-intent').exists()
+        retirement_cancel=(root/'retirement-cancel').exists()
+        if retirement_intent or retirement_cancel:
+            entry=manager._runs[record.run_ref.run_id]
+            if retirement_cancel:
+                # Interruption after the old controller saved cancel intent and before sending it.
+                entry.record=replace(entry.record,cancel_requested=True)
+                await manager._commit(entry,status='canceling',phase='canceling',retire_unsandboxed=True)
+            else:
+                await manager._commit(entry,retire_unsandboxed=True)
         deadline=time.monotonic()+15
         while not (root/'ticks').exists():
             assert time.monotonic()<deadline
@@ -58,43 +67,61 @@ async def scenario():
         await store.close()
         store,session=await open_store(resume=True)
         manager=controller(store)
+        run_id=record.run_ref.run_id
         if (root/'unconfirmed-identity').exists():
             manifest=directory/'manifest.json'
             original_manifest=manifest.read_bytes()
             manifest.write_bytes(b'invalid synthetic manifest')
             try:
-                unresolved=await manager.restore(retire_unsandboxed=True)
+                unresolved=await manager.restore(report_errors=True)
                 assert len(unresolved)==1 and unresolved[0].status=='unknown'
                 assert directory.exists()
+                assert manager.background_tasks()[0].sandbox_enabled is None
+                view=await manager.poll(run_id)
+                assert view['status']=='unknown' and view['sandboxEnabled'] is None and not view['stdout']
                 before=(root/'ticks').read_bytes()
                 await asyncio.sleep(.15)
                 assert (root/'ticks').read_bytes()!=before
             finally:
                 manifest.write_bytes(original_manifest)
-        assert await manager.restore(retire_unsandboxed=True) == ()
-        assert (await manager.poll(record.run_ref.run_id))['status']=='not-found'
-        assert await store.recover()==()
+        restored=await manager.restore(report_errors=True)
+        assert len(restored)==1 and restored[0].run_ref==record.run_ref
+        if retirement_cancel:
+            assert (await wait(manager,run_id))['status']=='canceled'
+            assert (await store.recover())[0].cancel_requested
+        else:
+            assert restored[0].status=='running' and not restored[0].cancel_requested
+            assert restored[0].snapshot.get('retire_unsandboxed') is not True
+            visible,=manager.background_tasks()
+            assert visible.run_id==run_id and visible.status=='running' and visible.sandbox_enabled is False
+            assert '[REDACTED]' in visible.description and 'synthetic-key' not in visible.description
+            view=await manager.poll(run_id)
+            assert view['status']=='running' and view['stdout'] and view['sandboxEnabled'] is False
+            before=(root/'ticks').read_bytes()
+            await asyncio.sleep(.15)
+            assert (root/'ticks').read_bytes()!=before
+            await manager.cancel(run_id)
+            assert (await wait(manager,run_id))['status']=='canceled'
         assert await store.intent('legacy','Bash',json.dumps({'command':command}),True)==ack
+        assert directory.exists() and (directory/'manifest.json').exists()
+        assert (directory/'stdout.txt').read_text().strip()
         if with_references:
             assert hashlib.sha256(proof.read_bytes()).hexdigest()==digest
-            assert (directory/'stdout.txt').read_text().strip()
-            assert not (directory/'manifest.json').exists()
             assert session.messages[-1]['content']==previous
-        else:
-            assert not directory.exists()
         legacy=next(message for message in session.messages if message.get('tool_call_id')=='legacy')
         assert legacy['content']==ack
         assert not (await store.background_view()).missing_attachments
         ticks=(root/'ticks').read_bytes()
         await asyncio.sleep(.15)
         assert (root/'ticks').read_bytes()==ticks
-        assert await manager.restore(retire_unsandboxed=True)==()
+        assert (await manager.restore(report_errors=True))[0].status=='canceled'
         await manager.close()
         await store.close()
         store,session=await open_store(resume=True)
         manager=controller(store)
-        assert await manager.restore(retire_unsandboxed=True)==()
+        assert (await manager.restore(report_errors=True))[0].status=='canceled'
         assert await store.intent('legacy','Bash',json.dumps({'command':command}),True)==ack
+        assert (root/'starts').read_text()=='once'
     finally:
         # Also adopt the fixture after a failing migration test so no test worker is left behind.
         await manager.restore()
@@ -104,8 +131,9 @@ asyncio.run(scenario())
 """
 
 
-@pytest.mark.parametrize("fixture", ["plain", "keep-references", "unconfirmed-identity"])
-def test_stops_and_removes_only_live_legacy_run_on_restore(tmp_path, fixture):
+@pytest.mark.parametrize("fixture", ["plain", "keep-references", "unconfirmed-identity",
+                                     "retirement-intent", "retirement-cancel"])
+def test_reconnects_legacy_background_and_keeps_history_without_replaying(tmp_path, fixture):
     if fixture != "plain":
         (tmp_path / fixture).touch()
-    _run_case(_RETIRE, tmp_path)
+    _run_case(_KEEP, tmp_path)

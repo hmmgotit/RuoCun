@@ -42,7 +42,7 @@ def test_ordinary_registry_exports_four_schedule_tools():
         "Schedule", "CronCreate", "CronDelete", "CronList"]
 
 
-def _exercise_turn_locks(tmp_path, patch):
+def _exercise_turn_locks(tmp_path, patch, sandbox_option):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
@@ -56,6 +56,14 @@ def _exercise_turn_locks(tmp_path, patch):
     for variable, value in _environment(tmp_path).items():
         patch.setenv(variable, value)
     patch.setenv("RUOCUN_THEME", "dark")
+    sandbox_enabled = bool(sandbox_option)
+    sandbox_status = "开启" if sandbox_enabled else "关闭"
+    legacy_value = "0" if sandbox_enabled else "1"
+    if sandbox_enabled:
+        patch.setenv("RUOCUN_SANDBOX", legacy_value)
+    else:
+        patch.delenv("RUOCUN_SANDBOX", raising=False)
+        (workspace / ".env").write_text(f"RUOCUN_SANDBOX={legacy_value}\n", encoding="utf-8")
     config = home / "config.json"
     config.write_text(json.dumps({"version": 2, "activeProfile": "synthetic", "profiles": {"synthetic": {
         "provider": "deepseek", "model": "synthetic-power-model", "key": "synthetic-power-key",
@@ -78,9 +86,10 @@ def _exercise_turn_locks(tmp_path, patch):
         locks.append(lock)
         return lock
 
-    async def run_turn(_session, _options, _registry, ctx, **_):
+    async def run_turn(session, _options, _registry, ctx, **_):
         index = len(entered)
-        entered.append(index)
+        entered.append((ctx.sandboxEnabled, ctx.notificationEnv.get("RUOCUN_SANDBOX"),
+                        f"受管 Shell 系统沙箱：{sandbox_status}。" in session.messages[0]["content"]))
         assert len(locks) == index + 1 and locks[index].releases == 0
         assert all(lock.releases == 1 for lock in locks[:index])
         if index == 1:
@@ -93,8 +102,14 @@ def _exercise_turn_locks(tmp_path, patch):
 
     patch.setattr(wakelock, "acquireWakeLock", acquire)
     patch.setattr(runtime, "run_turn", run_turn)
-    args = runtime._parser().parse_args(["--config", str(config), "--cwd", str(workspace),
-                                        "--no-memory", "--no-skills", "--no-mcp", "--no-hooks"])
+    argv = ["--config", str(config), "--cwd", str(workspace), "--no-memory", "--no-skills", "--no-mcp", "--no-hooks"]
+    if sandbox_option:
+        argv.append(sandbox_option)
+    args = runtime._parse_cli(argv)
+    literal = runtime._parse_cli([*argv, "--", "--sandbox"])
+    assert args.sandbox is literal.sandbox is sandbox_enabled
+    assert args.prompt == []
+    assert literal.prompt == ["--sandbox"]
 
     class Output(DummyOutput):
         def __init__(self):
@@ -122,10 +137,13 @@ def _exercise_turn_locks(tmp_path, patch):
 
             try:
                 await until(lambda: "RuoCun ·" in "".join(output.parts))
+                pipe.send_text("/doctor\r")
+                await until(lambda: f"受管 Shell 系统沙箱：{sandbox_status}" in "".join(output.parts))
                 assert not locks  # Idle REPL must not acquire a session-long lock.
                 for index in range(3):
                     pipe.send_text(f"synthetic-turn-{index}\r")
                     await until(lambda: len(entered) == index + 1)
+                    assert entered[index] == (sandbox_enabled, legacy_value, True)
                     if index == 1:
                         await owners[0]._pause()
                     await until(lambda: locks[index].releases == 1 and owners[0]._state != "running")
@@ -141,7 +159,8 @@ def _exercise_turn_locks(tmp_path, patch):
     asyncio.run(scenario())
 
 
-def test_turn_wake_lock_released_after_complete_cancel_and_exception(tmp_path):
+@pytest.mark.parametrize("sandbox_option", ("", "--sandbox"), ids=("sandbox-default", "sandbox-opt-in"))
+def test_turn_wake_lock_released_after_complete_cancel_and_exception(tmp_path, sandbox_option):
     package = Path(ruocun.__file__).resolve().parent.parent
     loader = """
 import runpy,sys
@@ -150,10 +169,10 @@ from pytest import MonkeyPatch
 sys.path.insert(0,sys.argv[1])
 exercise=runpy.run_path(sys.argv[2])["_exercise_turn_locks"]
 with MonkeyPatch.context() as patch:
-    exercise(Path(sys.argv[3]),patch)
+    exercise(Path(sys.argv[3]),patch,sys.argv[4])
 """
     result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", loader, str(package),
-                             str(Path(__file__).resolve()), str(tmp_path)], cwd=tmp_path,
+                             str(Path(__file__).resolve()), str(tmp_path), sandbox_option], cwd=tmp_path,
                             env=_environment(tmp_path), stdin=subprocess.DEVNULL, capture_output=True,
                             text=True, encoding="utf-8", timeout=45)
     assert result.returncode == 0, result.stdout + result.stderr

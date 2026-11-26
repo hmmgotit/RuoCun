@@ -32,6 +32,7 @@ from ..platform.windows.durable_file import (
     local_path,
     verify_private_file,
 )
+from ..platform.windows.sandbox import windowsSandboxWaitsForWorkload
 from ..session.contract import SHELL_LOG_FILES, RunRecord, RunRef
 from ..session.process_identity import identity_alive, process_identity
 from ..version import __version__
@@ -61,10 +62,10 @@ _STREAMS: tuple[Literal["stdout", "stderr"], ...] = ("stdout", "stderr")
 
 
 class ShellRunStore(Protocol):
+    def redact(self, text: str) -> str: ...
     async def prepare(self, run_ref: RunRef, snapshot: dict[str, Any]) -> RunRecord: ...
     async def commit(self, record: RunRecord) -> None: ...
     async def recover(self) -> tuple[RunRecord, ...]: ...
-    async def retire_shell_history(self, run_ref: RunRef, directory_identity: tuple[int, int]) -> None: ...
     async def pending_shell_retirements(self) -> dict[str, dict[str, Any]]: ...
     async def finish_shell_retirement(self, run_id: str) -> None: ...
 
@@ -86,6 +87,14 @@ class _Run:
     @property
     def directory(self) -> Path:
         return local_path(Path(self.record.snapshot["run_dir"]))
+
+
+@dataclass(frozen=True)
+class BackgroundShellStatus:
+    run_id: str
+    status: str
+    description: str
+    sandbox_enabled: bool | None
 
 
 class ManagedShellManager:
@@ -462,6 +471,8 @@ class ManagedShellManager:
             return {"id": run_id, "status": "not-found", "stdout": "", "stderr": ""}
         if entry.record.snapshot.get("resolved_by_user"):
             return {"id": run_id, "status": "resolved-by-user", "stdout": "[用户核实，非runner收据] " + str(entry.record.snapshot.get("user_evidence", "")), "stderr": ""}
+        if entry.record.status == "unknown" and not entry.manifest:
+            return {"id": run_id, "status": "unknown", "stdout": "", "stderr": "", "sandboxEnabled": None}
         async with entry.poll_lock:
             return await self._poll(run_id, incremental=incremental)
 
@@ -519,7 +530,21 @@ class ManagedShellManager:
                 entry.stderr_cursor = next_stderr
         return {"id": run_id, "status": entry.record.status, "stdout": stdout, "stderr": stderr,
                 "exitCode": entry.record.snapshot.get("code"), "runnerDir": str(entry.directory),
+                "sandboxEnabled": self._sandbox_enabled(entry),
                 "stdout_cursor": entry.stdout_cursor, "stderr_cursor": entry.stderr_cursor}
+
+    def background_tasks(self) -> tuple[BackgroundShellStatus, ...]:
+        tasks: list[BackgroundShellStatus] = []
+        for entry in self._runs.values():
+            record = entry.record
+            if (not record.snapshot.get("detached") or record.snapshot.get("resolved_by_user")
+                    or record.status not in {"launching", "running", "canceling", "unknown"}):
+                continue
+            plan = entry.manifest.get("plan")
+            command = plan.get("command") if isinstance(plan, dict) else None
+            description = self.store.redact(str(entry.manifest.get("description") or command or "Shell"))
+            tasks.append(BackgroundShellStatus(record.run_ref.run_id, record.status, description, self._sandbox_enabled(entry)))
+        return tuple(tasks)
 
     def bind_background(self, runtime: BackgroundRuntime) -> None:
         if runtime.sessionId != self.session_id or runtime.store is not self.store:
@@ -716,17 +741,18 @@ class ManagedShellManager:
 
     async def execute(
         self, plan: ShellExecutionPlan, signal: threading.Event, *, background: bool = False,
-        onOutput: OutputCallback | None = None, disableSandbox: bool = False,
+        onOutput: OutputCallback | None = None, disableSandbox: bool = False, sandbox_enabled: bool = True,
     ) -> ForegroundResult | str:
-        try:
-            plan = sandboxExecutionPlan(plan, disableSandbox)
-        except SandboxUnavailable as error:
-            raise ToolRejected(str(error)) from error
+        if sandbox_enabled or disableSandbox:
+            try:
+                plan = sandboxExecutionPlan(plan, disableSandbox)
+            except SandboxUnavailable as error:
+                raise ToolRejected(str(error)) from error
         entry = await self._start(plan, signal)
         if entry.terminal is not None and entry.terminal.get("started") is False:
-            if entry.terminal.get("launch_rejected") is True:
+            if entry.terminal.get("launch_rejected") is True and self._sandbox_enabled(entry) is True:
                 raise ToolRejected("Windows MXC 拒绝启动原始 Shell 进程，命令未执行。")
-            raise ToolRejected("实际Shell命令尚未启动，沙箱执行器已退出。")
+            raise ToolRejected("Shell 进程未启动，命令未执行。")
         run_id = entry.record.run_ref.run_id
         if background:
             await self.detach(run_id)
@@ -804,14 +830,23 @@ class ManagedShellManager:
                 self._foreground = None
 
     @staticmethod
-    def _legacy_direct_shell(entry: _Run) -> bool:
-        plan = parse_plan(entry.manifest["plan"])
-        return (
+    def _sandbox_enabled(entry: _Run) -> bool | None:
+        try:
+            plan = parse_plan(entry.manifest["plan"])
+        except (AttributeError, IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
+        if (plan.sandbox is not None and windowsSandboxWaitsForWorkload(plan)
+                and len(plan.argv) == 2 and plan.commandLine is None
+                and os.path.normcase(plan.argv[0]) == os.path.normcase(plan.sandbox.executable)):
+            return True
+        if (
             plan.sandbox is None and plan.dialect == "cmd"
             and Path(plan.argv[0]).name.casefold() == "cmd.exe"
             and plan.argv[1:] == ("/d", "/s", "/c", plan.command)
             and plan.commandLine == f'"{plan.argv[0]}" /d /s /c "{plan.command}"'
-        )
+        ):
+            return False
+        return None
 
     @staticmethod
     def _run_directory_identity(path: Path) -> tuple[int, int]:
@@ -855,34 +890,7 @@ class ManagedShellManager:
             else:
                 self.retirement_errors.pop(run_id, None)
 
-    async def _retire_live_shell(self, entry: _Run) -> None:
-        run_id = entry.record.run_ref.run_id
-        if entry.record.snapshot.get("retire_unsandboxed") is not True:
-            await self._commit(entry, retire_unsandboxed=True)
-        await self.cancel(run_id)
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            receipt = await self._port(self._terminal, entry)
-            if receipt is not None:
-                await self._accept_terminal(entry, receipt)
-                return
-            await asyncio.sleep(.1)
-        raise RuntimeError("原无沙箱Shell的退出未确认，保留运行历史。")
-
-    async def _purge_retired_shell(self, entry: _Run) -> None:
-        deadline = time.monotonic() + 15
-        runner = identity(entry.record.snapshot["runner_identity"])
-        while identity_alive(runner):
-            if time.monotonic() >= deadline:
-                raise RuntimeError("原无沙箱Shell的执行器仍在退出，暂缓清理运行历史。")
-            await asyncio.sleep(.05)
-        directory_identity = await self._port(self._run_directory_identity, entry.directory)
-        await self.store.retire_shell_history(entry.record.run_ref, directory_identity)
-        self._runs.pop(entry.record.run_ref.run_id, None)
-
-    async def restore(
-        self, *, report_errors: bool = False, retire_unsandboxed: bool = False,
-    ) -> tuple[RunRecord, ...]:
+    async def restore(self, *, report_errors: bool = False) -> tuple[RunRecord, ...]:
         for record in await self.store.recover():
             if record.snapshot.get("storage_link_version") != 1:
                 continue
@@ -918,24 +926,15 @@ class ManagedShellManager:
                 receipt = await self._port(self._terminal, entry)
                 if receipt is not None:
                     await self._accept_terminal(entry, receipt, recover=True)
-                    if retire_unsandboxed and record.snapshot.get("retire_unsandboxed") is True:
-                        await self._purge_retired_shell(entry)
                     continue
                 state = await self._connect(entry, adopt=True)
                 if state.get("started") is not True:
                     state = await self._wait_for_start(entry, state)
                 if state["status"] in TERMINAL:
                     await self._accept_start_terminal(entry)
-                    if retire_unsandboxed and record.snapshot.get("retire_unsandboxed") is True:
-                        await self._purge_retired_shell(entry)
                     continue
                 if not state.get("started"):
                     raise RuntimeError("runner未完成启动认领，恢复不重发start。")
-                if (retire_unsandboxed and state["status"] in {"running", "canceling"}
-                        and self._legacy_direct_shell(entry)):
-                    await self._retire_live_shell(entry)
-                    await self._purge_retired_shell(entry)
-                    continue
                 if not entry.record.snapshot.get("detached"):
                     await self.cancel(record.run_ref.run_id)
                     deadline = time.monotonic() + 15
@@ -951,25 +950,29 @@ class ManagedShellManager:
                         raise RuntimeError("未保留前台执行的取消仍未确认。")
                     continue
                 metadata: dict[str, Any] = {}
+                if record.snapshot.get("retire_unsandboxed") is True and self._sandbox_enabled(entry) is False:
+                    if record.cancel_requested:
+                        # 旧版已提交的取消可能还未送达；已认证并接回原 runner 后继续取消，保留记录。
+                        if state["status"] == "running":
+                            await self.cancel(record.run_ref.run_id)
+                        continue
+                    # 只有退役意向的旧后台任务可以正常接回。
+                    metadata["retire_unsandboxed"] = False
                 if "tool_result" not in entry.record.snapshot:
                     metadata["tool_result"] = self._recovery_ack(record.run_ref.run_id)
                 await self._commit(entry, status=state["status"], **metadata)
             except (OSError, ValueError, RuntimeError) as error:
-                if (entry is not None and entry.record.status in TERMINAL
-                        and entry.record.snapshot.get("retire_unsandboxed") is True):
-                    self.retirement_errors[record.run_ref.run_id] = type(error).__name__
-                    continue
                 if record.status in TERMINAL:
                     if report_errors:
                         self.recovery_errors[record.run_ref.run_id] = type(error).__name__
                         self._runs.pop(record.run_ref.run_id, None)
                         continue
                     raise RuntimeError("已完成执行的收据或输出附件未能核验，保留现场并停止恢复。") from error
-                if record.run_ref.run_id not in self._runs:
+                if entry is None:
                     self._runs[record.run_ref.run_id] = _Run(record, {}, b"")
                 await self._unknown(self._runs[record.run_ref.run_id], error)
-        if retire_unsandboxed:
-            await self._complete_retired_files()
+        # 旧版已经提交数据库退役事务的记录，按原有保留清单完成文件收尾。
+        await self._complete_retired_files()
         return tuple(entry.record for entry in self._runs.values())
 
     async def _close_bootstrap(self, entry: _Run, launcher: subprocess.Popen[bytes]) -> None:

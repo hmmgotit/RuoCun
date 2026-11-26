@@ -14,12 +14,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..platform.process_tree import ShellLaunchRejected, run_foreground_plan
-from ..platform.sandbox import SandboxUnavailable, sandboxExecutionPlan
 from ..platform.sandbox_policy import SandboxPolicy
 from ..platform.shell_plan import buildShellPlan
 from .execute import ShellToolOutput
 from .paths import classifyPath
-from .sandbox import prepareSandboxPlan
+from .sandbox import prepareShellExecutionPlan
 from .types import Tool, ToolContext, ToolRejected
 
 _PYTHON_INLINE = re.compile(r"(?:^|[\s;&|])python3?\s+-c\b")
@@ -129,11 +128,7 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     else:
         _pythonInlineStreak, _pythonInlineNudged = 0, False
     plan = ctx.getShellPlan(command, cwd) if ctx.getShellPlan is not None else buildShellPlan(command, cwd, analyze=False)
-    plan = await prepareSandboxPlan(plan, ctx, args.get("additionalWriteDirectories"))
-    try:
-        execution_plan = sandboxExecutionPlan(plan)
-    except SandboxUnavailable as error:
-        raise ToolRejected(str(error)) from error
+    execution_plan = await prepareShellExecutionPlan(plan, ctx, args.get("additionalWriteDirectories"))
     if background and ctx.managedShell is None:
         return "首版不支持 background=true；命令未执行。请使用前台执行。"
     if background and os.name != "nt":
@@ -143,7 +138,7 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
     output_callback = ctx.onShellOutput
     if ctx.managedShell is not None and (os.name == "nt" or background):
         managed = await ctx.managedShell.execute(execution_plan, execution_signal, background=background,
-                                                 onOutput=output_callback)
+                                                 onOutput=output_callback, sandbox_enabled=ctx.sandboxEnabled)
         if isinstance(managed, str):
             return (backup_notice + "\n" if backup_notice else "") + managed
         result = managed
@@ -176,7 +171,7 @@ async def _handler(args: dict[str, Any], ctx: ToolContext) -> str:
         except ShellLaunchRejected as error:
             raise ToolRejected(str(error)) from error
         except FileNotFoundError as error:
-            raise ToolRejected("沙箱启动文件或工作目录不可用，命令未执行。") from error
+            raise ToolRejected("Shell 启动文件或工作目录不可用，命令未执行。") from error
     ctx.pendingUnverifiedWrites.clear()
     if ctx.headless and ctx.todoWriteRequired is not None and (
         result.code in {132, 134, 135, 136, 139}
@@ -214,8 +209,8 @@ execShellTool = Tool(
         "PowerShell/pwsh/Bash须显式调用，按实际方言审批；非Windows使用/bin/sh。"
         "没有超时，Ctrl+C停止当前前台受管树；已绑定可恢复后端时支持background=true及同run转后台。"
         "Shell退出后遗留的受管子孙也会停止。查询内容用Grep、查路径用Glob、读文件用Read。"
-        "受管命令必须在系统沙箱内运行；沙箱不可用时拒绝执行。"
-        "Windows 可用 additionalWriteDirectories 请求本次额外写目录，需用户逐次批准。"
+        "系统沙箱默认关闭，用户可在启动时开启；开启后若后端不可用，该次命令会被拒绝。"
+        "Windows 启用沙箱时可用 additionalWriteDirectories 请求本次额外写目录，需用户批准。"
     ),
     schema={
         "type": "object",

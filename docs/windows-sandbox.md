@@ -1,6 +1,6 @@
 # Windows MXC 沙箱
 
-Windows 上的受管 Bash、Monitor 和子代理同类命令必须在 MXC ProcessContainer 中运行。依赖缺失、摘要不匹配或宿主无法执行策略时，该次命令报错。普通聊天和会话查看仍可用。旧的沙箱开关和整次绕过参数无法授权沙箱外执行。
+Windows 上默认关闭系统沙箱，受管 Bash、Monitor 和子代理的同类命令继续走权限规则和审批。加 `--sandbox` 启动若存后，这些命令在 MXC ProcessContainer 中运行。依赖缺失、摘要不匹配或宿主无法执行策略时，若存拒绝该次命令。普通聊天和会话查看仍可用。
 
 ## 独立固定依赖
 
@@ -14,7 +14,7 @@ Windows x64 `wxc-exec.exe` 的 SHA256 为：
 
 ```powershell
 $env:RUOCUN_MXC_EXEC = 'D:\tools\mxc-1.1.0\bin\x64\wxc-exec.exe'
-python -m ruocun
+python -m ruocun --sandbox
 ```
 
 将路径替换为实际解包位置。未设置时，若存从 `~/.ruocun/dependencies/mxc/1.1.0/bin/x64/wxc-exec.exe` 查找执行器。
@@ -27,11 +27,11 @@ python -m ruocun
 
 默认可写范围为命令启动时的工作目录和专用临时目录。命令内的 `cd` 不扩大范围。控制配置、执行器、Python 运行时及会话恢复材料受只读保护。
 
-命令可以通过 `additionalWriteDirectories` 请求额外可写目录。若存在审批端显示本次命令和具体目录，用户逐次批准后才加入这次执行计划。`Write/Edit` 走独立的文件工具审批，可使用已授予的一次、会话级或长期权限。后台任务按原签名计划接回。
+在 MXC 沙箱中，命令可以通过 `additionalWriteDirectories` 请求额外可写目录。若存向审批端显示本次命令和具体目录，用户逐次批准后才加入这次执行计划。沙箱关闭时，若存会拒绝带有非空额外写目录请求的命令，并提示该参数的适用条件。`Write/Edit` 走独立的文件工具审批，可使用已授予的一次、会话级或长期权限。已分离的后台任务按原签名计划接回，`/tasks` 显示任务实际使用的沙箱状态。
 
 Windows Shell 的临时文件和 pip/npm/Maven/Gradle 缓存指向 `~/.ruocun/sandbox/work/<工作目录身份>/temp/`，沙箱控制配置位于 `~/.ruocun/sandbox/control/`。缓存冷启动可能重新下载依赖。
 
-网络默认保留；现有 `RUOCUN_SANDBOX_NO_NET=1` 要求限制该命令网络。它不控制若存自身的模型请求或可信扩展。
+沙箱内命令默认可以联网。设置 `RUOCUN_SANDBOX_NO_NET=1` 可限制沙箱内命令联网。
 
 ## 能力边界
 

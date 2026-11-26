@@ -28,7 +28,8 @@ async def scenario():
     store=await Conversation.open(root/'session','n46',root,runtime,session,'synthetic-key',resume=False)
     background=BackgroundRuntime(store=store,workspaceRoot=root);await background.bind()
     manager=TaskManager(store,background)
-    ctx=ToolContext(str(root),taskManager=manager,getShellPlan=lambda command,cwd:buildShellPlan(command,cwd,analyze=False))
+    ctx=ToolContext(str(root),taskManager=manager,sandboxEnabled=sys.argv[4]=='sandbox',
+                    getShellPlan=lambda command,cwd:buildShellPlan(command,cwd,analyze=False))
     async def start(id,command,**extra):
         args={'command':command,'description':id,**extra}
         await store.intent(id,'Monitor',json.dumps(args),True)
@@ -88,12 +89,12 @@ asyncio.run(scenario())
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="uses controlled Windows SQLite and Job")
-@pytest.mark.native_mxc
-def test_source_monitor_batches_stdout_and_confirms_process_exit_before_terminal(tmp_path):
+@pytest.mark.parametrize("mode", ["host", pytest.param("sandbox", marks=pytest.mark.native_mxc)])
+def test_source_monitor_batches_stdout_and_confirms_process_exit_before_terminal(tmp_path, mode):
     source = Path(ruocun.__file__).resolve().parents[1]
     archive = Path(__file__).parent / "fixtures/sqlite-dll-win-x64-3540100.zip"
     result = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", _MONITOR,
-                             str(tmp_path), str(archive.resolve()), str(source)],
+                             str(tmp_path), str(archive.resolve()), str(source), mode],
                             capture_output=True, text=True, encoding="utf-8", timeout=35)
     assert result.returncode == 0, result.stderr + result.stdout
 
@@ -107,7 +108,7 @@ async def scenario():
     background=BackgroundRuntime(store=store,workspaceRoot=root);await background.bind()
     manager=TaskManager(store,background)
     workspace=root/'workspace';workspace.mkdir()
-    ctx=ToolContext(str(workspace),taskManager=manager)
+    ctx=ToolContext(str(workspace),taskManager=manager,sandboxEnabled=True)
     args={'command':'echo synthetic>should-not-run.txt','description':'refused'}
     try:
         await store.intent('monitor','Monitor',json.dumps(args),True)
@@ -157,7 +158,8 @@ async def scenario():
     store=await Conversation.open(root/'session','n46-crash',root,runtime,session,'synthetic-key',resume=False)
     background=BackgroundRuntime(store=store,workspaceRoot=root);await background.bind()
     manager=TaskManager(store,background)
-    ctx=ToolContext(str(root),taskManager=manager,getShellPlan=lambda command,cwd:buildShellPlan(command,cwd,analyze=False))
+    ctx=ToolContext(str(root),taskManager=manager,sandboxEnabled=True,
+                    getShellPlan=lambda command,cwd:buildShellPlan(command,cwd,analyze=False))
     script=root/'crash.py'
     script.write_text('import time\nfrom pathlib import Path\np=Path('+repr(str(root/'crash-heartbeat'))+')\n'
         'while True:\n p.write_text(str(time.monotonic()))\n print("crash tick",flush=True)\n time.sleep(.05)\n')

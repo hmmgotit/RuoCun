@@ -6,10 +6,31 @@ from dataclasses import replace
 from typing import Any
 
 from ..platform.file_contract import AtomicFileError
+from ..platform.sandbox import SandboxUnavailable, sandboxExecutionPlan
 from ..platform.sandbox_policy import createSandboxPolicy, sandboxEnvironment
 from ..platform.shell_plan import ShellExecutionPlan
 from ..platform.windows.sandbox import WindowsSandboxError
 from .types import ToolContext, ToolRejected
+
+
+def shellSandboxLabel(enabled: bool | None, lang: str = "zh") -> str:
+    if enabled is None:
+        return "Sandbox status unknown" if lang == "en" else "沙箱状态未知"
+    if enabled:
+        return "System sandbox" if lang == "en" else "系统沙箱"
+    return "No system sandbox" if lang == "en" else "无系统沙箱"
+
+
+async def prepareShellExecutionPlan(plan: ShellExecutionPlan, ctx: ToolContext, requested: Any = None) -> ShellExecutionPlan:
+    """按用户启动时选定的模式落实已审批的 Shell 计划。"""
+    if not ctx.sandboxEnabled:
+        if requested is not None and requested != []:
+            raise ToolRejected("当前未启用系统沙箱，不能请求额外沙箱写入目录。")
+        return plan
+    try:
+        return sandboxExecutionPlan(await prepareSandboxPlan(plan, ctx, requested))
+    except SandboxUnavailable as error:
+        raise ToolRejected(str(error)) from error
 
 
 async def prepareSandboxPlan(plan: ShellExecutionPlan, ctx: ToolContext, requested: Any = None) -> ShellExecutionPlan:

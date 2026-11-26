@@ -134,6 +134,7 @@ from ..tools.managed_shell import ManagedShellManager
 from ..tools.memory_read import makeMemoryReadTool
 from ..tools.memory_write import makeMemoryWriteTool
 from ..tools.registry import ToolRegistry
+from ..tools.sandbox import shellSandboxLabel
 from ..tools.skill_install import makeSkillInstallTool
 from ..tools.tool_batch import BatchCall
 from ..tools.tools_for_mode import apiToolsForMode
@@ -284,6 +285,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument("--model")
     parser.add_argument("--yolo", action="store_true")
+    parser.add_argument("--sandbox", action="store_true")
     parser.add_argument("--goal", "--task", "--coordinator", action="store_true")
     parser.add_argument("--continue", "-c", dest="resume", nargs="?", const="latest")
     parser.add_argument("--upgrade-session", help="停止旧进程后显式备份并离线升级会话")
@@ -320,7 +322,7 @@ def _parse_cli(arguments: Sequence[str]) -> argparse.Namespace:
     if "--" in raw:
         boundary = raw.index("--")
         raw, literal = raw[:boundary], raw[boundary + 1:]
-    flags = {"--yolo", "--continue", "-c", "--goal", "--task", "--coordinator", "--verbose", "--debug",
+    flags = {"--yolo", "--sandbox", "--continue", "-c", "--goal", "--task", "--coordinator", "--verbose", "--debug",
              "--api-key", "--provider", "--model", "--obs", "--reflect-memory", "--reflect-challenger",
              "--progress-advice", "--no-progress-advice", "--eval", "--no-memory", "--no-skills", "--no-hooks",
              "--no-mcp", "--no-project-instructions", "--no-web"}
@@ -376,7 +378,7 @@ def _parse_cli(arguments: Sequence[str]) -> argparse.Namespace:
             extension_positions.add(position)
             if resume_flag is None:
                 args.resume = token.removeprefix("--continue=") or "latest"
-    for name in ("yolo", "obs", "reflect-memory", "reflect-challenger", "progress-advice", "no-progress-advice", "eval",
+    for name in ("yolo", "sandbox", "obs", "reflect-memory", "reflect-challenger", "progress-advice", "no-progress-advice", "eval",
                  "no-memory", "no-skills", "no-hooks", "no-mcp", "no-project-instructions", "no-web"):
         setattr(args, name.replace("-", "_"), "--" + name in raw)
     args.goal = any(flag in raw for flag in ("--goal", "--task", "--coordinator"))
@@ -613,7 +615,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         text = buildSystemPrompt({
             "modelId": selected_model, "toolSummaries": tool_summaries,
             "platform": sys.platform, "interactive": not bool(args.prompt),
-            "projectInstructions": project_text, "memories": memory_text,
+            "projectInstructions": project_text, "memories": memory_text, "sandboxEnabled": args.sandbox,
         })
         catalog = skillCatalogLines(skills)
         if catalog:
@@ -629,7 +631,6 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                "TaskOutput读取子代理输出，TaskStop请求停止。"
                "进程取消请求与终态确认分开；其它扩展仅使用已注册工具及当前可见命令。"
                "工具按分层权限与有效模式裁决；plan限制普通文件写入和命令执行，记忆按其工具权限；auto分类失败转人工确认。"
-               "受管Shell始终使用系统沙箱；Windows使用MXC，macOS使用Seatbelt，Linux使用Bubblewrap。沙箱不可用时拒绝执行该次命令。"
                "支持静态Skills、文件访问发现、本地/Git安装、按需正文适配和上下文压缩。"
                "MemoryRead/MemoryWrite按需读写原生分域记忆；启动注入可关闭，维护不会改写本进程已选择的记忆前缀。"
                "摘要失败保留原上下文并停止本轮。其它未列工具只能通过当前文字交互请求用户决定。")
@@ -689,7 +690,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     ctx = ToolContext(str(cwd), cwd=str(cwd), signal=cancelled, sessionModel=session.model,
                       skills=skills, headless=bool(args.prompt), lang=getLang(), notificationEnv=env,
                       todoWriteRequired={"done": args.resume is not None} if args.prompt else None,
-                      toolAudit=tool_audit, memoryAudit=memory_audit)
+                      toolAudit=tool_audit, memoryAudit=memory_audit, sandboxEnabled=args.sandbox)
     ctx.createWorktree = lambda name: createWorktree(cwd, name, environ=env)
     async def read_current_archive(identity: str, offset: int, limit: int) -> dict[str, Any]:
         return await conversation.worker.archive_read(identity, offset=offset, limit=limit)
@@ -1342,7 +1343,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
             signal.signal(signal.SIGTERM, interrupt)
         shell_manager = ManagedShellManager(sessions_root / selected, selected, conversation)
         ctx.managedShell = shell_manager
-        await shell_manager.restore(report_errors=True, retire_unsandboxed=True)
+        await shell_manager.restore(report_errors=True)
         background = BackgroundRuntime(store=conversation, workspaceRoot=cwd)
         await background.bind()
         shell_manager.bind_background(background)
@@ -2251,6 +2252,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                        + (f"  ✓ ruocun 在 PATH: {command_path}\n" if command_path else "  · PATH未见ruocun；可用python -m ruocun\n")
                        + f"  · 工作区 {cwd} · 模型 {session.model} · {registry.countMcpTools()} 个MCP工具\n"
                        + f"  · SQLite {runtime.version}\n"
+                       + f"  · 受管 Shell 系统沙箱：{'开启' if args.sandbox else '关闭'}\n"
                        + "  · " + str(getWakeLockCapability()["reason"]) + "\n"
                        + ("  · Windows 本轮无系统定时后端；会话内/loop另计。" if os.name == "nt" else "  · 系统定时通过crontab，触发依赖机器开机且清醒。"))
                 return True, 0
@@ -2406,9 +2408,13 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                 output("已记入上下文，下次回复时可见。" if ctx.lang == "zh" else "Note saved for the next reply.")
                 return True, 0
             if name == "tasks":
-                running = task_manager.running()
-                rows = "\n".join(f"  {task.id} · {task.status} · {task.description}" for task in running)
-                output(f"后台任务({len(running)}):\n{rows}" if running else "无运行中的后台任务。")
+                rows = [f"  {task.id} · {task.status} · {task.description}" for task in task_manager.running()]
+                assert shell_manager is not None
+                rows.extend(
+                    f"  {task.run_id} · {task.status} · {shellSandboxLabel(task.sandbox_enabled)} · {task.description}"
+                    for task in shell_manager.background_tasks()
+                )
+                output(f"后台任务({len(rows)}):\n" + "\n".join(rows) if rows else "无运行中的后台任务。")
                 return True, 0
             if name == "copy":
                 last_reply = next((message["content"] for message in reversed(session.messages)

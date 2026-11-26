@@ -13,18 +13,19 @@ from time import monotonic
 from typing import Literal
 
 from ..platform.process_tree import ShellLaunchUnconfirmed, run_foreground_plan
-from ..platform.sandbox import SandboxUnavailable, sandboxExecutionPlan
+from ..platform.sandbox import SandboxUnavailable
 from ..platform.shell_plan import ShellExecutionPlan
 
 
 async def runMonitor(plan: ShellExecutionPlan, description: str, signal: threading.Event, *,
                      timeout_ms: int | None, emit: Callable[[str], Awaitable[None]],
-                     onStarted: Callable[[], Awaitable[None]] | None = None) -> str:
-    plan = sandboxExecutionPlan(plan)
+                     onStarted: Callable[[], Awaitable[None]] | None = None,
+                     sandbox_enabled: bool) -> str:
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     pending = ""
-    if os.name != "nt":
+    needs_posix_marker = sandbox_enabled and os.name != "nt"
+    if needs_posix_marker:
         # 启动确认由沙箱内的固定前置命令输出。确认写出后才运行原命令。
         token = secrets.token_hex(16)
         pending = token + "\n"
@@ -48,7 +49,9 @@ async def runMonitor(plan: ShellExecutionPlan, description: str, signal: threadi
         if text:
             loop.call_soon_threadsafe(queue.put_nowait, text)
 
-    execution = asyncio.create_task(asyncio.to_thread(run_foreground_plan, plan, signal, onLogOutput=output, onStarted=started))
+    execution = asyncio.create_task(asyncio.to_thread(
+        run_foreground_plan, plan, signal, onLogOutput=output, onStarted=None if needs_posix_marker else started,
+    ))
     end = monotonic() + timeout_ms / 1000 if timeout_ms is not None else None
     timed_out, partial = False, ""
     lines: list[str] = []

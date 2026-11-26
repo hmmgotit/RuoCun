@@ -15,6 +15,7 @@
   --permission-mode <auto|default|plan|bypassPermissions> 设置权限模式
   --allow 规则 / --ask 规则 / --deny 规则  追加本次权限规则
   --add-dir 目录  允许访问的额外工作目录
+  --sandbox     为本次启动的新受管 Shell 命令开启系统沙箱，默认关闭
   --yolo        免审批模式；deny 规则与危险调用边界仍有效
   --goal、--task、--coordinator  启用同一长任务模式，保留权限边界
   --continue, -c [会话ID]  恢复本目录会话，省略ID选最近未完成会话
@@ -26,7 +27,7 @@
   --no-progress-advice  关闭无人值守入口默认的本地进度提醒
   --progress-advice  来源兼容参数；提醒仍按入口类型决定，TTY不因此单独启用
   --eval        本次隔离磁盘技能/自定义代理、记忆注入、MCP、项目指令和联网工具
-                内置Skills及Hooks仍按来源保留；不是OS沙箱，独立关闭需使用下方开关
+                内置Skills及Hooks仍按来源保留；系统沙箱单独由 --sandbox 开启
   --no-memory    本次关闭启动记忆注入和模型整理；本地清理、记忆工具与命令仍可用
   --no-skills    本次禁用磁盘与内置Skills；内置命令仍可用
   --no-hooks    本次禁用用户、项目及子代理 Hooks
@@ -40,7 +41,7 @@
 审批中Esc/Ctrl+C取消当前问题并暂停，草稿与确认输入由同一终端读取。
 暂停会持久丢弃尚未消费的排队输入；修改模式、上下文设置/压缩及技能选择/开关前先暂停并等待当前轮停止。
 用量、状态、文件、权限规则等只读查询不暂停。/usage、/cost 查看累计token及本次进程费用。
-/help 查看本帮助；/doctor 汇总账户、依赖、配置与平台能力；/agents 查看实际可用代理定义。
+/help 查看本帮助；/doctor 汇总账户、依赖、配置、平台能力与当前沙箱模式；/agents 查看实际可用代理定义。
 命令区分大小写，/Config保留大写；/tmp/a.py 等路径按普通输入处理，合法未知命令会提示错误。
 保留的固定命令与来源别名（不包含范围外插件）：
   /model /plan /clear /compact /cost /lang /help /exit /quit /skills /context /context-window
@@ -92,6 +93,7 @@ AskUserQuestion支持自由回答、多选与先讨论；SendUserMessage在终�
 NotifyUser按需给终端内best-effort提示，不发送系统桌面通知；TaskWait等待已确认的后台Shell事件。
 Bash的background=true保留同一受管执行；BashOutput读取新增日志，KillShell请求停止并核实真实终态。
 显式保留后台Shell后，重开会话接管同一run；普通子代理不保证退出进程后继续运行。
+Windows 已分离后台Shell沿用启动时的执行方式，/tasks 显示实际沙箱状态。
 完整Shell日志位于回执中的私有运行目录，停止未确认时保留现场并报告，不自动重放。
 EnterPlanMode/ExitPlanMode按需加载；plan限制普通文件写入与命令执行，记忆工具按权限运行。
 Read支持png/jpg/gif/webp，图片需所选模型支持视觉；图片结果随会话保存。
@@ -116,7 +118,8 @@ LSP从用户/项目lsp.json配置servers(command/args/extensions)，按需启动
 /audit [memory|reflect|tools|perms|cache|skills] 查看脱敏本地审计；可选远端trace与本地日志分开记录。
 观测失败不改变业务结果，关闭时不导入可选SDK；LMNR_BASE_URL/HTTP_PORT/PROJECT_API_KEY配置HTTP出口。
 Deck 外部面板通过本机回环协议查看并控制同一会话。
-受管 Shell 必须使用系统沙箱。Windows 使用微软 MXC 执行器（RUOCUN_MXC_EXEC 可指定固定版本的绝对路径），Linux 使用 Bubblewrap，macOS 使用 Seatbelt。后端不可用时拒绝该次命令。Windows 额外写目录须逐次用户批准。评估模式与工具权限审批各自独立。
+系统沙箱默认关闭，Bash、Monitor 和子代理的同类命令仍走权限规则和审批。
+使用 --sandbox 开启后，Windows 使用微软 MXC 执行器（RUOCUN_MXC_EXEC 可指定固定版本的绝对路径），Linux 使用 Bubblewrap，macOS 使用 Seatbelt。后端不可用时拒绝该次命令。Windows 沙箱内的额外写目录须逐次用户批准。
 完整真实终端的最终体验验收仍单独记录。
 环境开关使用 RUOCUN_ 前缀。MAX_BUDGET默认提醒，MAX_BUDGET_HARD=1才硬停；
 MAX_TURNS可设回合工具轮数上限；默认不限制。失败后已确认工具不会自动重放。

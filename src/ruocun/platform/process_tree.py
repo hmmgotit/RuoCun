@@ -73,11 +73,17 @@ def _run_posix(
     argv: list[str], cwd: str, env: dict[str, str], signal: threading.Event,
     onChunk: ChunkCallback | None = None, *, captureOutput: bool = True,
     stdinData: bytes | None = None, cap: int = OUT_CAP, perStreamLimit: bool = False,
+    onStarted: Callable[[], None] | None = None,
 ) -> tuple[bytes, bytes, int, bool, bool]:
-    process = subprocess.Popen(
-        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL if stdinData is None else subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
-    )
+    try:
+        process = subprocess.Popen(
+            argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL if stdinData is None else subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+    except OSError as error:
+        if onStarted is None:
+            raise
+        raise ShellLaunchRejected("Shell 启动文件或工作目录不可用，命令未执行。") from error
     # 以独立进程组启动，后续可一次终止 Shell 和同组子进程。
     signals = importlib.import_module("signal")
     killpg = getattr(os, "killpg")
@@ -114,10 +120,12 @@ def _run_posix(
     if stdinData is not None:
         assert process.stdin is not None
         readers.append(threading.Thread(target=_write_process_input, args=(process.stdin, stdinData, read_errors), daemon=True))
-    for reader in readers:
-        reader.start()
     aborted = False
     try:
+        if onStarted is not None:
+            onStarted()
+        for reader in readers:
+            reader.start()
         while process.poll() is None:
             if signal.is_set() or capped.is_set() or read_errors:
                 aborted = signal.is_set()
@@ -144,6 +152,7 @@ def run_foreground_argv(
     decodeClixml: bool = False, onRawOutput: ChunkCallback | None = None, captureOutput: bool = True,
     onLogOutput: OutputCallback | None = None, stdinData: bytes | None = None, outputLimit: int | None = None,
     stdoutFilter: Callable[[bytes], bytes] | None = None,
+    onStarted: Callable[[], None] | None = None,
 ) -> ForegroundResult:
     """用已解析的可执行文件绝对路径和参数启动受控前台进程树。"""
     start = time.monotonic()
@@ -184,12 +193,12 @@ def run_foreground_argv(
 
         stdout, stderr, code, aborted, capped = run_managed(
             argv, cwd, env, signal, cap, commandLine=commandLine, onChunk=chunk, captureOutput=captureOutput,
-            stdinData=stdinData, perStreamLimit=outputLimit is not None, stdoutFilter=stdoutFilter,
+            stdinData=stdinData, perStreamLimit=outputLimit is not None, stdoutFilter=stdoutFilter, onStarted=onStarted,
         )
     else:
         stdout, stderr, code, aborted, capped = _run_posix(
             argv, cwd, env, signal, onChunk=chunk, captureOutput=captureOutput,
-            stdinData=stdinData, cap=cap, perStreamLimit=outputLimit is not None,
+            stdinData=stdinData, cap=cap, perStreamLimit=outputLimit is not None, onStarted=onStarted,
         )
     for index, decoder in enumerate(decoders):
         tail = decoder.finish()
@@ -268,6 +277,7 @@ def run_foreground_plan(plan: "ShellExecutionPlan", signal: threading.Event, *, 
         list(plan.argv), plan.cwd, signal, environ=dict(plan.environment), commandLine=plan.commandLine,
         codec=plan.codec, onOutput=onOutput, decodeClixml=decode_clixml, onRawOutput=onRawOutput,
         captureOutput=captureOutput, onLogOutput=onLogOutput, stdoutFilter=accept_start if markers is not None else None,
+        onStarted=onStarted if markers is None else None,
     )
     if markers is not None and not (confirmed or rejected or result.aborted):
         raise ShellLaunchUnconfirmed(f"MXC 执行器退出（exit={result.code}），原命令启动未确认。")

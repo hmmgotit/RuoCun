@@ -1,4 +1,4 @@
-"""File sandbox routing from the frozen baseline and ADR-0023's mandatory boundary."""
+"""File sandbox routing and explicit startup selection of the isolation boundary."""
 
 import asyncio
 import os
@@ -7,7 +7,7 @@ import threading
 import pytest
 
 
-def test_legacy_settings_cannot_disable_the_native_sandbox():
+def test_legacy_settings_cannot_disable_an_explicitly_selected_native_sandbox():
     from ruocun.platform.sandbox import sandboxSpawn
 
     for platform, backend in (("linux", "/usr/bin/bwrap"), ("darwin", "/usr/bin/sandbox-exec")):
@@ -50,7 +50,7 @@ def test_source_sandbox_platform_file_routes_and_missing_binaries():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows native fail-closed route")
-def test_windows_bash_never_runs_without_mxc_or_bypasses_sandbox(tmp_path):
+def test_windows_bash_uses_only_the_selected_sandbox_mode(tmp_path):
     from ruocun.platform.shell_plan import buildShellPlan
     from ruocun.tools.exec_shell import execShellTool
     from ruocun.tools.managed_shell import ManagedShellManager
@@ -69,7 +69,7 @@ def test_windows_bash_never_runs_without_mxc_or_bypasses_sandbox(tmp_path):
             pytest.fail("unsupported sandbox prepared a durable runner")
 
     async def scenario():
-        ctx = ToolContext(str(tmp_path), getShellPlan=lambda *_: selected_plan)
+        ctx = ToolContext(str(tmp_path), getShellPlan=lambda *_: selected_plan, sandboxEnabled=True)
         managed = ManagedShellManager(tmp_path / "session", "synthetic", UnexpectedStore())
         with pytest.raises(ToolRejected, match="MXC.*命令未执行"):
             await execShellTool.handler({"command": command}, ctx)
@@ -90,5 +90,14 @@ def test_windows_bash_never_runs_without_mxc_or_bypasses_sandbox(tmp_path):
         with pytest.raises(ToolRejected, match="MXC.*命令未执行"):
             await execShellTool.handler({"command": command}, ctx)
         assert not output.exists() and not backup.exists()
+
+        ctx.sandboxEnabled = False
+        with pytest.raises(ToolRejected, match="未启用系统沙箱"):
+            await execShellTool.handler({"command": command, "additionalWriteDirectories": [str(tmp_path)]}, ctx)
+        assert not output.exists()
+        result = await execShellTool.handler({"command": command}, ctx)
+        assert "[exit 0" in result
+        assert output.read_text().strip() == "ok"
+        assert backup.read_text() == "existing test data"
 
     asyncio.run(scenario())

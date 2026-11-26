@@ -167,12 +167,12 @@ def validate_terminal(receipt: dict[str, Any], manifest: dict[str, Any], directo
         raise ValueError("runner终态退出码无效。")
     if (receipt["status"] == "completed" and code != 0) or (receipt["status"] == "failed" and code == 0):
         raise ValueError("runner终态与退出码冲突。")
-    if receipt["status"] != "canceled" and windowsSandboxWaitsForWorkload(parse_plan(manifest["plan"])):
-        if receipt.get("launch_rejected") is True:
-            if receipt["status"] != "failed" or receipt.get("started") is not False:
-                raise ValueError("runner启动拒绝收据状态冲突。")
-        elif receipt.get("started") is not True:
-            raise ValueError("runner终态缺少实际命令启动确认。")
+    if receipt.get("launch_rejected") is True:
+        if receipt["status"] != "failed" or receipt.get("started") is not False:
+            raise ValueError("runner启动拒绝收据状态冲突。")
+    elif (receipt["status"] != "canceled" and receipt.get("started") is not True
+          and windowsSandboxWaitsForWorkload(parse_plan(manifest["plan"]))):
+        raise ValueError("runner终态缺少实际命令启动确认。")
 
 
 class Runner:
@@ -322,10 +322,7 @@ class Runner:
             os.fsync(data.fileno())
         verify_private_file(claim)
         sync_directory(self.directory)
-        if windowsSandboxWaitsForWorkload(self.plan):
-            self.state.update(phase="start-claimed", status="launching")
-        else:
-            self.state.update(started=True, phase="started", status="running")
+        self.state.update(phase="start-claimed", status="launching")
         self.persist()
         worker = threading.Thread(target=self.execute, name="ruocun-shell-executor")
         self.worker = worker

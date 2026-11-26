@@ -6,7 +6,6 @@ import ruocun
 
 
 def test_public_version_matches_installed_distribution_metadata():
-    assert metadata.version("ruocun") == "2.1.0"
     assert ruocun.__version__ == metadata.version("ruocun")
 
 

@@ -98,6 +98,7 @@ class ToolContext:
     extractFromPage: Callable[[str, str], Awaitable[str]] | None = None
     lsp: LspManager | None = None
     archiveRead: Callable[[str, int, int], Awaitable[dict[str, Any]]] | None = None
+    sandboxEnabled: bool = False
 
 
 @dataclass(frozen=True)

@@ -73,11 +73,12 @@ def run_managed(
     *, commandLine: str | None = None, onChunk: Callable[[int, bytes], None] | None = None,
     captureOutput: bool = True, stdinData: bytes | None = None, perStreamLimit: bool = False,
     stdoutFilter: Callable[[bytes], bytes] | None = None,
+    onStarted: Callable[[], None] | None = None,
 ) -> tuple[bytes, bytes, int, bool, bool]:
     """返回 stdout、stderr、退出码和取消、超量状态，执行异常继续向上抛出。"""
     import msvcrt
 
-    from ..process_tree import _write_process_input
+    from ..process_tree import ShellLaunchRejected, _write_process_input
 
     native = importlib.import_module("_winapi")
     k = _kernel()
@@ -177,11 +178,16 @@ def run_managed(
             startup.lpAttributeList = {"handle_list": handles}
             thread: Any = None
             try:
-                process, thread, _, _ = native.CreateProcess(
-                    argv[0], commandLine if commandLine is not None else subprocess.list2cmdline(argv), None, None, True,
-                    0x4 | subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    env, cwd, startup,
-                )
+                try:
+                    process, thread, _, _ = native.CreateProcess(
+                        argv[0], commandLine if commandLine is not None else subprocess.list2cmdline(argv), None, None, True,
+                        0x4 | subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+                        env, cwd, startup,
+                    )
+                except OSError as error:
+                    if onStarted is None:
+                        raise
+                    raise ShellLaunchRejected("Shell 启动文件或工作目录不可用，命令未执行。") from error
                 try:
                     _check(k.AssignProcessToJobObject(job, process))
                     if k.ResumeThread(thread) == 0xFFFFFFFF:
@@ -195,6 +201,8 @@ def run_managed(
                     native.CloseHandle(thread)
                 for handle in handles:
                     os.set_handle_inheritable(handle, False)
+        if onStarted is not None:
+            onStarted()
         for index in (3, 1):
             os.close(pipes[index])
         read_fds = [pipes[0], pipes[2]]
