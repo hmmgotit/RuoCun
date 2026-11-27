@@ -26,6 +26,7 @@ from ..platform.windows.durable_file import (
 from ..tools.types import ToolRejected
 from .frontmatter import parseMemoryFile, serializeMemory
 from .types import Memory, MemoryType, Scope
+from .validate import Verdict, _validate
 
 _SCOPE_ORDER: tuple[Scope, ...] = ("project", "user", "knowledge")
 _COMMAND_ORDER: tuple[Scope, ...] = ("user", "knowledge", "project")
@@ -174,6 +175,31 @@ class MemoryStore:
         self, scopes: Sequence[Scope] = _SCOPE_ORDER, *, includeSuperseded: bool = False,
     ) -> list[MemoryEntry]:
         return await asyncio.to_thread(self._load, tuple(scopes), includeSuperseded)
+
+    def projectionStates(self, versions: set[tuple[str, str]]) -> dict[tuple[str, str], Verdict]:
+        """核对本次将发送的 Markdown 版本，只为可见的引用读取文件来源。"""
+        if not versions:
+            return {}
+        project = projectIdOf(self.cwd)
+        today = self.today()
+        result: dict[tuple[str, str], Verdict] = {}
+        seen: set[str] = set()
+        for entry in self._load(_SCOPE_ORDER, False):
+            memory = entry.memory
+            if entry.scope == "knowledge" and not keepKnowledgeForProject(memory, project):
+                continue
+            identity = f"{entry.scope}/{memory.name}"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            key = identity, entry.contentDigest
+            if key not in versions:
+                continue
+            if entry.scope == "project" or (entry.scope == "knowledge" and memory.origin == project):
+                result[key] = _validate(memory, self.cwd, today)
+            else:
+                result[key] = "stale" if memory.validUntil and memory.validUntil < today else "ok"
+        return result
 
     def _loadNative(self, scope: Scope, includeSuperseded: bool) -> list[MemoryEntry]:
         entries = self._scan(_Directory(self._native[scope]), scope, strictNative=True)

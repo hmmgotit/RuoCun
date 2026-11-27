@@ -19,12 +19,12 @@ import threading
 import time
 import urllib.error
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 from ..config.compat import resolve_env
 from . import client, responses
-from .types import StreamChatOptions, StreamDelta
+from .types import ChatMessage, StreamChatOptions, StreamDelta
 
 # 过载、网关失败和限流候选状态。429 最终还要核对 Retry-After。
 RETRYABLE_STATUS: frozenset[int] = frozenset(
@@ -184,6 +184,16 @@ class ResilientContext:
     on_attempt: Callable[[AttemptRecord], None] | None = None
     resolver_command: tuple[str, ...] | None = None
     on_resolver_start: Callable[[subprocess.Popen[bytes]], None] | None = None
+    messages_for_attempt: Callable[[], list[ChatMessage]] | None = None
+
+
+def bind_request_view(opts: StreamChatOptions, ctx: ResilientContext,
+                      view: Callable[[list[ChatMessage]], list[ChatMessage]]) -> tuple[StreamChatOptions, ResilientContext]:
+    messages = opts.get("messages", [])
+    if not messages:
+        return opts, ctx
+    refresh = ctx.messages_for_attempt or (lambda: view(messages))
+    return {**opts, "messages": refresh()}, replace(ctx, messages_for_attempt=refresh)
 
 
 @dataclass(frozen=True)
@@ -547,6 +557,9 @@ def streamChatResilient(
     fallback_used = False
     state_out: dict[str, Any] = {}
 
+    def current_options() -> StreamChatOptions:
+        return {**opts, "messages": ctx.messages_for_attempt()} if ctx.messages_for_attempt else opts
+
     def emit(
         status: Literal["complete", "partial", "failed"],
         *,
@@ -672,7 +685,7 @@ def streamChatResilient(
         watchdog.start(abort_connection)
         try:
             result = client.runStreamAttempt(
-                opts, transport=attempt_send, env=env,
+                current_options(), transport=attempt_send, env=env,
                 on_chunk=watchdog.check,
                 on_effective_delta=watchdog.reset,
                 on_delta=ctx.on_delta,
@@ -814,7 +827,7 @@ def streamChatResilient(
                             'The value of "delay" is out of range. '
                             'It must be an integer between 0 and 4294967295.'
                         )
-                    fb = _nonStreamingFallback(opts, attempt_send, env)
+                    fb = _nonStreamingFallback(current_options(), attempt_send, env)
                     fallback_watchdog.check()
                     deltas, message, usage, finish = fb
                     if ctx.on_delta is not None:

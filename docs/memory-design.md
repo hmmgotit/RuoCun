@@ -12,6 +12,25 @@
 
 普通 CLI 的自动学习默认是 `off`。受控学习使用 `--memory-learning controlled` 显式开启，先从当前项目中的明确纠错、稳定约定和验证过的做法选候选。技术经验包含「适用条件、做法、证据」，写入之前还要核对所引用的文件版本。历史桌面启动配置曾显式开启受控学习，仍按启动参数决定 CLI 行为。选择 `--memory-strategy task` 也能为任务补充相关历史记录，自动提炼仍由学习开关控制。[CLI 默认值](../src/ruocun/agent/runtime.py#L283) · [经验提炼](../src/ruocun/agent/controlled_learning.py#L295) · [写入前校验](../src/ruocun/agent/controlled_learning.py#L426)
 
+## 跨会话工程记忆
+
+在目标工作区启动交互 CLI，执行 `/memory project enable`。新会话沿用本地开启状态。原生 Markdown、锁定项与兼容来源仍按既有规则读取。开启后，新任务可按原文、代码符号和当前可用的语义模型召回工程摘录。任务自动补充合计最多两条、2400 字符。批处理可读取适用的项目经验，只有显式指定当前目标才允许积累，例如 `ruocun --cwd D:/work/api --project-memory-write D:/work/api "检查导出"`。
+
+| 要做的事 | 在交互 CLI 中输入 |
+| --- | --- |
+| 查看当前库与一条记录 | `/memory project status`、`/memory project list`、`/memory project show <ID>` |
+| 让当前 B 读取 A 的摘录 | `/memory project link "D:/work/A"`。取消用 `unlink` |
+| 把本库核实的单条记录发布给 B | `/memory project publish <ID> "D:/work/B"` |
+| 更正、撤回 | `/memory project correct <ID> 新规则`、`/memory project forget <ID>`。也可直接说“请忘记工程记忆 <ID>” |
+| 选定旧材料 | `/memory project backfill session <会话ID> [其他ID]` 或 `/memory project backfill range <开始UTC毫秒> <结束UTC毫秒>`，时间范围左闭右开 |
+| 设置本库内容配额 | `/memory project quota <字节>`，默认 8 MiB |
+| 配置、检查本地语义检索 | `/memory project vectors local "D:/models/multilingual-e5-small"`、`/memory project vectors status`、`/memory project vectors rebuild` |
+| 显式使用外部向量服务 | `/memory project vectors remote <HTTPS embeddings端点> <模型> [密钥环境变量名]`。该服务会收到查询和已授权的候选摘录。用 `vectors off` 切回纯词法 |
+
+本地 E5 需要可选依赖 `ruocun[semantic]` 和预先放在指定目录的 `tokenizer.json`、`model.onnx`。本地也支持有词数、维度文件头的文本 `.vec`。模型缺失或超时时，若存继续用原文及符号检索。开启项目无须下载权重。使用 `MemoryRead` 时，工程 ID 可精确读取，`project: 查询词` 可搜索获准的项目摘录。手动按名管理 Markdown 仍使用原入口。
+
+更正和撤回以存储提交为界。下一次外发请求重新核对原条目、共享授权、启动片段、工具回执及压缩摘要。旧会话原文继续由会话归档管理。工作区关联只授权短摘录，原会话与工具日志仍按执行范围访问。[项目存储](../src/ruocun/memory/project_store.py) · [发送前投影](../src/ruocun/memory/project_projection.py)
+
 ## 工程与论文参考
 
 | 来源 | 对照阅读 |

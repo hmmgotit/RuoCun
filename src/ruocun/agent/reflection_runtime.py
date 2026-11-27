@@ -127,7 +127,8 @@ class ReflectionRuntime:
                     "confirmed": applied.get("confirmed", 0)})
 
     async def after_turn(self, identity: str, *, provider: str, compaction_imminent: bool = False,
-                         cancelled: Callable[[], bool] | None = None) -> None:
+                         cancelled: Callable[[], bool] | None = None, analyze: Analyze | None = None,
+                         eligible: bool | None = None) -> None:
         if not self.enabled or self.stopped or self.conversation.blocked:
             return
         await self.drain()
@@ -138,7 +139,7 @@ class ReflectionRuntime:
             messages = copy.deepcopy(self.session.messages)
             reason = ("analysis_failed" if self.controlled_budget.get("halted") else
                       "analysis_limit" if self.controlled_budget.get("analyses", 0) >= 6 else
-                      "no_learning_evidence" if not hasLearningEvidence(messages) else None)
+                      "no_learning_evidence" if not (hasLearningEvidence(messages) if eligible is None else eligible) else None)
             if reason is not None:
                 state.update(id=identity, phase="skipped", controlled=True, reason=reason)
                 await self.conversation.set_reflection_state(self.session, state)
@@ -151,7 +152,7 @@ class ReflectionRuntime:
             self.controlled_budget["analyses"] = self.controlled_budget.get("analyses", 0) + 1
             self.analysis_cancelled = cancelled if cancelled is not None else lambda: False
             self.identity = identity
-            self.task = asyncio.create_task(self.analyze(messages), name="ruocun-controlled-learning")
+            self.task = asyncio.create_task((analyze or self.analyze)(messages), name="ruocun-controlled-learning")
             # 普通 /exit 会触发退出取消，先在当前配对边界收尾，
             # 让已完成的经验有机会保存。
             await asyncio.wait({self.task})

@@ -15,6 +15,7 @@ from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any
 
+from ..memory.project_projection import memory_versions
 from .contract import ArchiveImport, ArchiveRewrite, StoreError
 
 if TYPE_CHECKING:
@@ -117,10 +118,12 @@ def _insert(con: "sqlite3.Connection", scope: str, value: dict[str, Any], index:
             raise StoreError("不可变归档 ID 对应不同内容。")
         return
     _put(con, key, value)
+    dependencies = memory_versions([value["message"]]) if "message" in value else ()
     index.append({key: value[key] for key in ("id", "kind", "created_at", "raw_seq", "version", "digest",
                                               "sources", "previous", "before_seq", "boundary", "origin_session",
                                               "origin_scope", "attachments") if key in value}
-                 | ({"display_length": len(canonical(_display(value["message"])))} if "message" in value else {}))
+                 | ({"display_length": len(canonical(_display(value["message"])))} if "message" in value else {})
+                 | ({"memory_versions": dependencies} if dependencies else {}))
 
 
 def projection(con: "sqlite3.Connection", scope: str = "main") -> dict[str, Any]:
@@ -394,7 +397,10 @@ def read_archive(con: "sqlite3.Connection", scope: str, identity: str, *,
         total = len(full_text)
         text = full_text[offset:offset + limit]
     end = min(total, offset + limit)
-    return {"id": identity, "scope": scope, "kind": value["kind"], "text": text,
+    versions = {tuple(pair) for entry in (index[identity], *originals.values())
+                for pair in entry.get("memory_versions", ())}
+    return {**({"memory_versions": sorted(versions)} if versions else {}),
+            "id": identity, "scope": scope, "kind": value["kind"], "text": text,
             "total": total, "next_offset": end if end < total else None,
             "digest": value["digest"], "source_count": len(value.get("sources", [])),
             "derived_message": canonical(_display(value["message"]))[:512] if value["kind"] in {"summary", "prune"} else None,

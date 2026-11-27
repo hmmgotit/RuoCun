@@ -16,6 +16,8 @@ def test_product_distribution_needs_no_development_runtime_dependencies():
     assert {item for item in requirements if ";" not in item} == {
         "prompt-toolkit==3.0.52", "rich==14.1.0", "wcwidth==0.9.4", "mcp==1.30.0", "tree-sitter==0.25.2", "tree-sitter-go==0.25.0", "tree-sitter-java==0.23.5", "tree-sitter-javascript==0.25.0", "tree-sitter-python==0.25.0", "tree-sitter-rust==0.24.0", "tree-sitter-typescript==0.23.2"}
     assert {item for item in requirements if ";" in item} == {
+        'onnxruntime<2,>=1.18;extra=="semantic"',
+        'tokenizers<1,>=0.19;extra=="semantic"',
         'opentelemetry-api==1.45.2;extra=="observation"',
         'opentelemetry-sdk==1.45.2;extra=="observation"',
         'opentelemetry-exporter-otlp-proto-http==1.45.2;extra=="observation"',

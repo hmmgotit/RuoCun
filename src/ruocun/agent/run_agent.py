@@ -14,12 +14,18 @@ from pathlib import Path
 from time import time_ns
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from ..client.resilient import ResilientContext, ResilientResult, streamChatResilient
+from ..client.resilient import (
+    ResilientContext,
+    ResilientResult,
+    bind_request_view,
+    streamChatResilient,
+)
 from ..client.types import ChatMessage, ImageData, StreamChatOptions
 from ..config.compat import reasoning_effort, resolve_env
 from ..config.model_selection import getAgentModel
 from ..hooks.hooks import HookRuntime
 from ..hooks.journal import HookOutcomeUnknown
+from ..memory.project_projection import filter_projection
 from ..obs.backend import observationScope, spanScope
 from ..obs.wrap import wrapRequest
 from ..permissions.runtime import PermissionRuntime
@@ -363,6 +369,15 @@ async def runPreparedAgent(
 ) -> TurnResult:
     """以同一套子代理回合引擎驱动同步和受管后台执行。"""
     def request_model(opts: StreamChatOptions, context: ResilientContext) -> ResilientResult:
+        def child_view(messages: list[ChatMessage]) -> list[ChatMessage]:
+            view = prepared.ctx.projectMemoryView
+            if view is None:
+                return filter_projection(messages, lambda _identity, _version: False)
+            return view(prepared.ctx.cwd or prepared.ctx.workspaceRoot, messages)
+
+        opts, context = bind_request_view(opts, context, child_view)
+        if request is not None:
+            return request(opts, context)
         return wrapRequest(streamChatResilient)(opts, env=dict(prepared.env), context=context)
 
     def api_tools() -> list[dict[str, Any]]:
@@ -376,7 +391,7 @@ async def runPreparedAgent(
     prepared.ctx.archiveRead = getattr(journal, "archive_read", None)
     context = ContextManager(prepared.session, cast(ContextJournal, journal), prepared.ctx,
                              prepared.options, dict(prepared.env), lambda _message: None,
-                             request=request or request_model, permission_mode=permit.getMode)
+                             request=request_model, permission_mode=permit.getMode)
     owner = agentApprovalSignal.set(prepared.ctx.signal)
     record = getattr(journal, "record", None)
     ref = record.run_ref if record is not None else None
@@ -390,7 +405,7 @@ async def runPreparedAgent(
                     call_scope=prepared.parent_permissions.callScope,
                     permission_mode=permit.getMode,
                 ),
-                request=request or request_model, journal=journal, tool_batch_scope=tool_batch_scope,
+                request=request_model, journal=journal, tool_batch_scope=tool_batch_scope,
                 api_tools=api_tools, on_boundary=on_boundary,
                 context_hooks=ContextHooks(
                     compact=context.recover_overflow, request_preflight=context.before_request,

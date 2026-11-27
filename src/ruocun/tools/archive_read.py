@@ -6,6 +6,7 @@ import json
 import re
 from typing import Any
 
+from ..memory.project_projection import mark_derived
 from .schema import objectSchema
 from .types import Tool, ToolContext, ToolRejected
 
@@ -23,7 +24,9 @@ def makeArchiveReadTool() -> Tool:
         if ctx.signal.is_set():
             raise ToolRejected("归档读取已取消。")
         result = await ctx.archiveRead(identity, offset, limit)
-        return json.dumps(result, ensure_ascii=False)
+        result = dict(result)
+        versions = [tuple(pair) for pair in result.pop("memory_versions", [])]
+        return mark_derived(json.dumps(result, ensure_ascii=False), versions)
 
     return Tool(
         name="ArchiveRead", capability="read", handler=read,

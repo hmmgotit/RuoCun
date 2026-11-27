@@ -10,10 +10,14 @@ import re
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from .inject import StartupMemorySnapshot, _retentionScore
 from .store import MemoryEntry, MemoryStore, keepKnowledgeForProject, projectIdOf
 from .validate import Verdict, validateMemory
+
+if TYPE_CHECKING:
+    from .project_store import ProjectMemory
 
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[\u3400-\u9fff]+")
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
@@ -60,6 +64,7 @@ class TaskRecallResult:
     foreign: int = 0
     skipped: int = 0
     excluded_full_ids: tuple[str, ...] = ()
+    versions: tuple[tuple[str, str], ...] = ()
 
     @property
     def statistics(self) -> dict[str, int]:
@@ -105,6 +110,32 @@ def _record(entry: MemoryEntry, verdict: Verdict) -> str:
     return f"[{entry.scope}/{memory.name}]{title}{source}\n{memory.text}{warning}"
 
 
+async def _visible_markdown(
+    store: MemoryStore, checks_only: bool,
+) -> tuple[list[tuple[MemoryEntry, Verdict]], int, int, int]:
+    today, project_id = store.today(), projectIdOf(store.cwd)
+    seen: set[tuple[str, str]] = set()
+    entries: list[tuple[MemoryEntry, Verdict]] = []
+    stale = changed = foreign = 0
+    for entry in await store.load(("project", "user", "knowledge")):
+        memory = entry.memory
+        key = (entry.scope, memory.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        if entry.scope == "knowledge" and not keepKnowledgeForProject(memory, project_id):
+            foreign += 1
+            continue
+        verdict = await validateMemory(memory, store.cwd, today)
+        if verdict == "stale":
+            stale += 1
+            continue
+        changed += int(verdict == "changed")
+        if not checks_only or memory.type in ("semantic", "procedural"):
+            entries.append((entry, verdict))
+    return entries, stale, changed, foreign
+
+
 async def _buildTaskMemory(
     store: MemoryStore, query: str, *, maxItems: int = 6, maxChars: int = 6000,
     excludeFullText: Collection[tuple[str, str]] = (),
@@ -123,26 +154,11 @@ async def _buildTaskMemory(
     header = _HEADER if startup is None else _CHECK_HEADER
     if not terms or maxItems == 0 or maxChars < len(header):
         return _publish(TaskRecallResult(), onRecall)
-    today, project = store.today(), projectIdOf(store.cwd)
-    seen: set[tuple[str, str]] = set()
+    today = store.today()
     live: list[tuple[MemoryEntry, Verdict, frozenset[str], frozenset[str]]] = []
-    stale = changed = foreign = 0
-    for entry in await store.load(("project", "user", "knowledge")):
+    entries, stale, changed, foreign = await _visible_markdown(store, startup is not None)
+    for entry, verdict in entries:
         memory = entry.memory
-        key = (entry.scope, memory.name)
-        if key in seen:
-            continue
-        seen.add(key)
-        if entry.scope == "knowledge" and not keepKnowledgeForProject(memory, project):
-            foreign += 1
-            continue
-        verdict = await validateMemory(memory, store.cwd, today)
-        if verdict == "stale":
-            stale += 1
-            continue
-        changed += int(verdict == "changed")
-        if startup is not None and memory.type not in ("semantic", "procedural"):
-            continue
         title = _terms(f"{memory.name} {memory.title or ''}"[:_TEXT_LIMIT])
         body = _terms(memory.text[:_TEXT_LIMIT])
         live.append((entry, verdict, title, body))
@@ -196,17 +212,27 @@ async def buildTaskMemory(
     store: MemoryStore, query: str, *, maxItems: int = 6, maxChars: int = 6000,
     excludeFullText: Collection[tuple[str, str]] = (),
     onRecall: Callable[[dict[str, int]], None] | None = None,
+    project: ProjectMemory | None = None,
 ) -> TaskRecallResult:
     """构建原有的任务记忆补充文本，沿用默认的选择和渲染。"""
+    if project is not None and project.enabled:
+        from .project_search import buildProjectRecall
+        result = await buildProjectRecall(store, project, query, maxItems=maxItems, maxChars=maxChars,
+                                          excludeFullText=excludeFullText)
+        return _publish(result, onRecall)
     return await _buildTaskMemory(store, query, maxItems=maxItems, maxChars=maxChars,
                                   excludeFullText=excludeFullText, onRecall=onRecall)
 
 
 async def buildMemoryChecks(
     store: MemoryStore, query: str, *, startup: StartupMemorySnapshot,
+    project: ProjectMemory | None = None,
 ) -> TaskRecallResult:
     """在含可信指令的 2400 字符预算内，提供至多两条旧错检查。
 
     提示供普通模型和工具循环核对，记忆存储、用量及置信度沿用原值。
     """
+    if project is not None and project.enabled:
+        from .project_search import buildProjectRecall
+        return await buildProjectRecall(store, project, query, startup=startup)
     return await _buildTaskMemory(store, query, maxItems=2, maxChars=2400, startup=startup)

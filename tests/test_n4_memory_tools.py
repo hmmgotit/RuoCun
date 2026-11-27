@@ -43,6 +43,60 @@ def test_source_memory_read_exact_partial_and_across_scopes(memory, query, name,
     asyncio.run(scenario())
 
 
+def test_read_marks_changed_or_missing_sources_without_hiding_history(memory):
+    store, read, write, ctx, _ = memory
+    source = store.cwd / "settlement-policy.txt"
+    title = "结算舍入约定"
+    old_rule = "逐笔舍入后再加总。"
+
+    async def scenario():
+        source.write_text(old_rule, encoding="utf-8")
+        await write.handler({"title": title, "text": old_rule, "source": source.name}, ctx)
+        query = {"query": title}
+        original = await read.handler(query, ctx)
+        assert old_rule in original
+        assert "来源文件已变更" not in original
+
+        source.write_text("先加总，再舍入一次。", encoding="utf-8")
+        changed = await read.handler(query, ctx)
+        assert changed.startswith("来源文件已变更")
+        assert original in changed
+
+        source.unlink()
+        missing = await read.handler(query, ctx)
+        assert missing.startswith("来源无法核实")
+        assert original in missing
+
+    asyncio.run(scenario())
+
+
+def test_project_read_marks_each_source_warning_with_its_own_memory_version(memory):
+    from ruocun.memory.project_projection import memory_versions
+    from ruocun.memory.project_store import ProjectMemory
+
+    store, _, write, ctx, user = memory
+    project = ProjectMemory(user, store.cwd)
+    project.enable()
+    read = makeMemoryReadTool(store, project)
+
+    async def scenario():
+        for label in ("blue", "green"):
+            path = store.cwd / (label + ".txt")
+            path.write_text(label, encoding="utf-8")
+            await write.handler({"title": "palette " + label, "text": "Paint " + label,
+                                 "source": path.name}, ctx)
+        (store.cwd / "blue.txt").write_text("indigo", encoding="utf-8")
+        result = await read.handler({"query": "palette"}, ctx)
+        entries = await store.load()
+        expected = {(f"project/{e.memory.name}", e.contentDigest) for e in entries}
+        assert len(expected) == 2
+        assert set(memory_versions([{"role": "tool", "content": result}])) == expected
+        assert "palette blue（来源文件已变更。" in result
+        assert "palette green（" not in result
+
+    asyncio.run(scenario())
+
+
 def test_write_records_project_markdown(memory):
     store, _, write, ctx, _ = memory
     assert asyncio.run(write.handler({"text": "本项目用 vitest"}, ctx)) == "已记住(项目级):本项目用 vitest"

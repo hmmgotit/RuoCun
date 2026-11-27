@@ -99,6 +99,7 @@ class ToolContext:
     lsp: LspManager | None = None
     archiveRead: Callable[[str, int, int], Awaitable[dict[str, Any]]] | None = None
     sandboxEnabled: bool = False
+    projectMemoryView: Callable[[str, list[dict[str, Any]]], list[dict[str, Any]]] | None = None
 
 
 @dataclass(frozen=True)

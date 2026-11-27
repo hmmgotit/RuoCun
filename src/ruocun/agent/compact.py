@@ -245,6 +245,8 @@ async def buildCompaction(
     summary = (await opts["summarize"](copy.deepcopy(messages[:cut]))).strip()
     if not summary:
         raise CompactionError("摘要为空，原上下文保留。")
+    from ..memory.project_projection import mark_derived, memory_versions
+    summary = mark_derived(summary, memory_versions(messages[:cut]))
     archive_id = _archiveId(messages, summary_sources, "summary", opts)
     checkpoint: ChatMessage = {"role": "system", "content":
         f"[早期对话摘要]\n{summary}\n[原文归档:{archive_id}；需要细节时用 ArchiveRead。]"}

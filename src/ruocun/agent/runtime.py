@@ -27,7 +27,12 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from ..approval.types import ApprovalDecision, ApprovalRequest
-from ..client.resilient import ResilientContext, ResilientResult, streamChatResilient
+from ..client.resilient import (
+    ResilientContext,
+    ResilientResult,
+    bind_request_view,
+    streamChatResilient,
+)
 from ..client.types import StreamChatOptions, StreamDelta, Usage
 from ..commands.builtin import runBuiltinCommand
 from ..commands.catalog import parseSlashCommand
@@ -69,6 +74,8 @@ from ..memory.memory_audit import (
     RecallCounts,
     createMemoryAuditSink,
 )
+from ..memory.project_projection import mark_derived, memory_versions, workspace_view
+from ..memory.project_store import ProjectMemory
 from ..memory.retrieval import buildMemoryChecks, buildTaskMemory
 from ..memory.store import MemoryStore
 from ..memory.types import Scope
@@ -163,6 +170,8 @@ from .deck_bridge import DeckBridge, DeckOptions, deck_managed
 from .files import filesReport
 from .input_broker import InputBroker
 from .loop import TurnResult, run_turn, sanitizeHistoryForResume
+from .project_commands import projectCommand
+from .project_learning import capture_project_turn
 from .reflect_persist import applyReflectResult
 from .reflect_prompts import CHALLENGER_PROMPT, REFOCUSER_PROMPT
 from .reflect_result import ReflectResult
@@ -298,6 +307,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-project-instructions", action="store_true")
     parser.add_argument("--reflect-memory", action="store_true")
     parser.add_argument("--memory-learning", choices=("off", "controlled"), default="off")
+    parser.add_argument("--project-memory-write", type=Path, help="显式允许批处理积累到当前工作区")
     parser.add_argument("--reflect-challenger", action="store_true")
     parser.add_argument("--obs", action="store_true")
     parser.add_argument("--verbose", "--debug", action="store_true")
@@ -342,14 +352,17 @@ def _parse_cli(arguments: Sequence[str]) -> argparse.Namespace:
     if resume and not resume.startswith("-"):
         flags.add(resume)
     extension_positions: set[int] = set()
+    args.learning_off_explicit = False
     for position, token in enumerate(raw):
         if token == "--memory-learning":
             if position + 1 >= len(raw) or raw[position + 1] not in {"off", "controlled"}:
                 parser.error("--memory-learning 需要 off 或 controlled")
             args.memory_learning = raw[position + 1]
+            args.learning_off_explicit = args.memory_learning == "off"
             extension_positions.update((position, position + 1))
         elif token.startswith("--memory-learning="):
             args.memory_learning = token.partition("=")[2]
+            args.learning_off_explicit = args.memory_learning == "off"
             if args.memory_learning not in {"off", "controlled"}:
                 parser.error("--memory-learning 需要 off 或 controlled")
             extension_positions.add(position)
@@ -386,7 +399,7 @@ def _parse_cli(arguments: Sequence[str]) -> argparse.Namespace:
     # 首个凭据决定配置，其余凭据值仍属于敏感数据。
     # 把它们也从候选提示参数中去除，避免发给模型。
     flags.update(raw[index + 1] for index, token in enumerate(raw[:-1]) if token == "--api-key")
-    for flag, attribute in (("--config", "config"), ("--cwd", "cwd")):
+    for flag, attribute in (("--config", "config"), ("--cwd", "cwd"), ("--project-memory-write", "project_memory_write")):
         for position, token in enumerate(raw):
             if token.startswith(f"{flag}="):
                 setattr(args, attribute, Path(token.partition("=")[2]))
@@ -449,6 +462,8 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     cwd = args.cwd.resolve(strict=True)
     if not cwd.is_dir():
         raise CliError("工作目录必须是目录。")
+    if args.project_memory_write is not None and Path(args.project_memory_write).resolve() != cwd:
+        raise CliError("批处理记忆写入目标必须与当前工作区相同。")
     user_root = Path.home() / ".ruocun"
     if args.upgrade_session is not None:
         from ..session.upgrade import upgrade_session
@@ -568,9 +583,25 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     registry = _registry(web=not args.no_web)
     registry.register(makeConfigTool(user_root))
     registry.register(makeSkillInstallTool(user_root))
+    archive = files("ruocun").joinpath("resources/runtime/sqlite-dll-win-x64-3540100.zip")
+    with as_file(archive) as archive_path:
+        dll = verify_official_archive(archive_path, user_root / "runtime" / "sqlite-3.54.1")
+    runtime = verify_controlled_runtime(dll)
     memory_store = MemoryStore(cwd, user_root, extension_sources)
-    registry.register(makeMemoryReadTool(memory_store))
-    registry.register(makeMemoryWriteTool(memory_store))
+    project_memory = ProjectMemory(user_root, cwd)
+
+    def project_writable() -> bool:
+        return (not args.no_memory and not args.eval and not args.learning_off_explicit
+                and (not args.prompt or args.project_memory_write is not None) and project_memory.enabled
+                and Path(ctx.cwd or ctx.workspaceRoot).resolve() == cwd)
+
+    def register_memory_tools() -> None:
+        selected_project = project_memory if project_memory.enabled else None
+        registry.register(makeMemoryReadTool(memory_store, None if args.no_memory else selected_project))
+        registry.register(makeMemoryWriteTool(memory_store, project=selected_project,
+            allow_project_write=project_writable, project_user_request=lambda: (current_input_id, current_original or "")))
+
+    register_memory_tools()
     registry.register(makeArchiveReadTool())
     tool_definitions = registry.toApiTools()
     tool_summaries = "\n".join(
@@ -607,11 +638,17 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
             stopped_gc_scopes[memory_scope] = None
     # 每个进程在启动时固定一份快照。会话恢复沿用可信的工具消息配对。
     recall_counts: RecallCounts = {"injected": 0, "stale": 0, "changed": 0, "types": {}}
+    if args.project_memory_write is not None and not project_memory.enabled:
+        raise CliError("指定的批处理目标尚未开启工程记忆。")
     startup_snapshot = (StartupMemorySnapshot() if args.no_memory else
-                        await buildStartupMemorySnapshot(memory_store, onRecall=recall_counts.update))
+                        await buildStartupMemorySnapshot(memory_store, onRecall=recall_counts.update,
+                                                         tracked=project_memory.enabled, project=project_memory))
     memory_text = startup_snapshot.text
 
     def system_prompt(selected_model: str) -> str:
+        engineering_enabled = not args.no_memory and project_memory.enabled
+        memory_contract = ("MemoryRead/MemoryWrite按需读写原生分域记忆，启动注入可关闭。" if engineering_enabled else
+                           "MemoryRead/MemoryWrite按需读写原生分域记忆；启动注入可关闭，维护不会改写本进程已选择的记忆前缀。")
         text = buildSystemPrompt({
             "modelId": selected_model, "toolSummaries": tool_summaries,
             "platform": sys.platform, "interactive": not bool(args.prompt),
@@ -632,8 +669,14 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                "进程取消请求与终态确认分开；其它扩展仅使用已注册工具及当前可见命令。"
                "工具按分层权限与有效模式裁决；plan限制普通文件写入和命令执行，记忆按其工具权限；auto分类失败转人工确认。"
                "支持静态Skills、文件访问发现、本地/Git安装、按需正文适配和上下文压缩。"
-               "MemoryRead/MemoryWrite按需读写原生分域记忆；启动注入可关闭，维护不会改写本进程已选择的记忆前缀。"
+               f"{memory_contract}"
                "摘要失败保留原上下文并停止本轮。其它未列工具只能通过当前文字交互请求用户决定。")
+        if engineering_enabled:
+            text += ("\n工程记忆记录当时的事实和条件。以当前要求、源码和测试决定本次交付。"
+                     "这次例外只适用于本次，明确长期更正时才改变指定规则。"
+                     "对照当前代码核实旧经验，在 Todo 中安排相关验证，只凭本次工具结果报告通过。"
+                     "两条业务约定确有冲突且影响交付、现有依据无法决定时，再向用户澄清。"
+                     "使用 MemoryRead 的 project: 查询或工程 ID 查看证据。明确忘记或更正时用 MemoryWrite 提交并报告回执。")
         if terminal_session and getLang() == "zh":
             text += ("\n\n中文终端思考语言：除非用户明确指定思考语言，推理正文始终使用简体中文。"
                      "即使输入或工具结果包含英文也保持中文思考。代码、命令和标识符保留原文。")
@@ -649,10 +692,6 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     # 按工作目录隔离普通会话，避免 latest 选到其他项目。
     scope = hashlib.sha256(os.path.normcase(str(cwd)).encode("utf-8")).hexdigest()[:20]
     sessions_root = user_root / "sessions" / scope
-    archive = files("ruocun").joinpath("resources/runtime/sqlite-dll-win-x64-3540100.zip")
-    with as_file(archive) as archive_path:
-        dll = verify_official_archive(archive_path, user_root / "runtime" / "sqlite-3.54.1")
-    runtime = verify_controlled_runtime(dll)
     # StoragePort 只创建最终会话目录，所需的两层私密父目录由启动入口建立。
     # 对已有目录校验访问控制，保持它原有的 ACL。
     ensure_private_dir(user_root / "sessions")
@@ -911,7 +950,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     controlled_sources: dict[str, dict[str, str]] = {}
 
     def tool_saved(call: dict[str, Any], message: dict[str, Any]) -> None:
-        if (getattr(args, "memory_learning", "off") == "controlled" and not args.no_memory
+        if ((getattr(args, "memory_learning", "off") == "controlled" or project_writable()) and not args.no_memory
                 and "__tracking_failed__" not in controlled_sources):
             try:
                 observeLearningSources(session.messages, cwd, controlled_sources)
@@ -991,7 +1030,16 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     ctx.cacheAudit, ctx.auditRedact = cache_sink, conversation.redact
     request_number = 0
 
+    def project_memory_view(workspace: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        root = Path(workspace).resolve()
+        local_project = project_memory if root == cwd else ProjectMemory(user_root, root)
+        local_store = memory_store if root == cwd else MemoryStore(root, user_root, compat.DEFAULT_COMPATIBILITY)
+        return workspace_view(local_store, local_project, messages, enabled=not args.no_memory)
+
+    ctx.projectMemoryView = project_memory_view
+
     def request(opts: StreamChatOptions, context: ResilientContext) -> ResilientResult:
+        opts, context = bind_request_view(opts, context, lambda msgs: project_memory_view(ctx.cwd or ctx.workspaceRoot, msgs))
         if opts.get("tools"):
             opts = opts.copy()
             opts["extra"] = {"reasoning_effort": compat.reasoning_effort(env), **opts.get("extra", {})}
@@ -1119,6 +1167,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
     controlled_signal: threading.Event = memory_stop
 
     async def analyze_reflection(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        project_managed = project_memory.enabled
         if controlled_learning:
             entries = sorted((entry.memory for entry in await memory_store.load() if entry.memory.title),
                              key=lambda memory: memory.importance, reverse=True)[:30]
@@ -1126,7 +1175,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                 options={**options, "model": session.model}, call=call_reflection, cwd=cwd,
                 existing=[{"title": memory.title or "", "text": memory.text} for memory in entries],
                 signal=controlled_signal, validation_sources=copy.deepcopy(controlled_sources))
-            return cast(dict[str, Any], conversation._safe(learned))
+            return {**cast(dict[str, Any], conversation._safe(learned)), "project_managed": project_managed}
         fork = compat.resolve_env("DISTILL_FORK", env) != "0"
         current_options: StreamChatOptions = {**options, "model": session.model, "tools": api_tools()}
         if not fork:
@@ -1138,7 +1187,9 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
             existing=[{"title": memory.title or "", "text": memory.text} for memory in entries],
             fork=fork, reasoningEffort=compat.reasoning_effort(env), signal=memory_stop,
             taskAware=getattr(args, "memory_strategy", "startup") == "task")
-        return cast(dict[str, Any], conversation._safe(result))
+        if project_managed and result.get("advisory"):
+            result["advisory"] = mark_derived(result["advisory"] or "", memory_versions(messages))
+        return {**cast(dict[str, Any], conversation._safe(result)), "project_managed": project_managed}
 
     async def call_reflection(opts: StreamChatOptions) -> str | None:
         reflection_signal = controlled_signal if controlled_learning else memory_stop
@@ -1162,7 +1213,10 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         return content if isinstance(content, str) else None
 
     async def apply_reflection(result: dict[str, Any]) -> dict[str, Any]:
-        if controlled_learning:
+        if result.get("project_managed") or project_memory.enabled:
+            from .project_learning import apply_project_reflection
+            applied = await asyncio.to_thread(apply_project_reflection, project_memory, result, signal=controlled_signal)
+        elif controlled_learning:
             applied = await applyControlledResult(result, memory_store, today=memory_today, signal=controlled_signal)
         else:
             applied = await applyReflectResult(cast(ReflectResult, result), memory_store,
@@ -1176,6 +1230,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         analyze=analyze_reflection, apply=apply_reflection, audit=memory_audit.reflected, notice=output, env=env,
         controlled=controlled_learning, controlled_budget=getattr(args, "_controlled_learning_budget", None))
     current_input_id = ""
+    current_original: str | None = None
 
     async def challenge(kind: str) -> str | None:
         if compat.resolve_env("REFLECT", env) == "0":
@@ -1255,7 +1310,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         return await conversation.queue_user(session, content)
 
     async def consume_user(input_id: str) -> bool:
-        nonlocal prompt_rejected, exit_code, current_input_id
+        nonlocal prompt_rejected, exit_code, current_input_id, current_original
         item = next(entry for entry in conversation.queued_inputs() if entry.input_id == input_id)
         original = originalInput(item.payload)
         projection = None
@@ -1288,15 +1343,23 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         hook_context = outcome.additional_context.strip()
         contexts = [f"[hook 注入的上下文]\n{hook_context}"] if hook_context else []
         task_memory = None
+        task_root = Path(ctx.cwd or ctx.workspaceRoot).resolve()
+        task_store = memory_store if task_root == cwd else MemoryStore(task_root, user_root, compat.DEFAULT_COMPATIBILITY)
+        task_project = project_memory if task_root == cwd else ProjectMemory(user_root, task_root)
+        project_reads = not args.no_memory and task_project.enabled
         if (not outcome.block and not args.no_memory
-                and (controlled_learning or getattr(args, "memory_strategy", "startup") == "task")):
+                and (project_reads or controlled_learning or getattr(args, "memory_strategy", "startup") == "task")):
             current = modelInput(item.payload) if projection is None else projection
             query = current if isinstance(current, str) else "\n".join(
                 str(part.get("text", "")) for part in current if part.get("type") == "text")
-            if controlled_learning:
-                task_memory = await buildMemoryChecks(memory_store, query, startup=startup_snapshot)
+            if project_reads:
+                from ..memory.project_search import buildProjectRecall
+                task_memory = await buildProjectRecall(task_store, task_project, query,
+                                                       startup=startup_snapshot if task_root == cwd else StartupMemorySnapshot())
+            elif controlled_learning:
+                task_memory = await buildMemoryChecks(task_store, query, startup=startup_snapshot if task_root == cwd else StartupMemorySnapshot())
             else:
-                task_memory = await buildTaskMemory(memory_store, query, excludeFullText=startup_snapshot.full_ids,
+                task_memory = await buildTaskMemory(task_store, query, excludeFullText=startup_snapshot.full_ids if task_root == cwd else (),
                                                    maxItems=2, maxChars=2400)
             if task_memory.text:
                 contexts.append(task_memory.text)
@@ -1309,6 +1372,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
         prompt_rejected = outcome.block
         if accepted:
             current_input_id = input_id
+            current_original = conversation.redact(original) if isinstance(original, str) else None
         if outcome.block:
             output(f"[提交被 Hook 阻止] {outcome.reason}")
         if accepted and interactive:
@@ -2018,7 +2082,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                             on_delta=delta, on_tool_result=tool_result, notice=output,
                             on_assistant_saved=assistant_saved if broker is not None or deck is not None else None,
                             on_tool_message=(
-                                tool_saved if broker is not None or deck is not None or controlled_learning else None
+                                tool_saved if broker is not None or deck is not None or controlled_learning or project_writable() else None
                             ),
                             accepts_delta=lambda: scheduler is not None and scheduler.is_current(generation),
                         ),
@@ -2044,12 +2108,34 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                         ),
                     )
                 if result.status == "complete" and scheduler.is_current(generation):
+                    project_plan: dict[str, Any] = {}
+                    if project_writable():
+                        projection_state = await conversation.worker.archive_projection("main")
+                        accepted_messages = conversation.redacted_messages(session.messages)
+                        await asyncio.to_thread(capture_project_turn, project_memory,
+                            accepted_messages, session_id=selected, lineage=projection_state["lineage"],
+                            original_user=current_original, source_snapshots=controlled_sources)
+                        if controlled_learning:
+                            from .project_learning import prepare_project_reflection
+                            project_plan = await asyncio.to_thread(prepare_project_reflection, project_memory,
+                                accepted_messages, session_id=selected, lineage=projection_state["lineage"],
+                                original_user=current_original)
                     if controlled_learning:
                         controlled_signal = ControlledLearningSignal(memory_stop, signal_event,
                             lambda: current_scheduler.is_current(generation))
-                    await reflector.after_turn(current_input_id, provider=account["provider"],
-                                               compaction_imminent=at_context_threshold(),
-                                               cancelled=controlled_signal.is_set if controlled_learning else None)
+                    if controlled_learning and project_memory.enabled:
+                        from .project_learning import reflect_project_evidence
+
+                        async def analyze_project(_: list[dict[str, Any]]) -> dict[str, Any]:
+                            return await reflect_project_evidence(project_plan, project=project_memory,
+                                options={**options, "model": session.model}, call=call_reflection, signal=controlled_signal)
+
+                        await reflector.after_turn(current_input_id, provider=account["provider"],
+                            cancelled=controlled_signal.is_set, analyze=analyze_project, eligible=bool(project_plan))
+                    else:
+                        await reflector.after_turn(current_input_id, provider=account["provider"],
+                            compaction_imminent=at_context_threshold(),
+                            cancelled=controlled_signal.is_set if controlled_learning else None)
                 if result.status == "complete" and at_context_threshold() and scheduler.is_current(generation):
                     try:
                         await context_manager.compact()
@@ -2235,7 +2321,7 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
             return 0
 
         async def command(name: str, arguments: str) -> tuple[bool, int]:
-            nonlocal active, cancelled, theme_background, long_task, preserve_pause
+            nonlocal active, cancelled, theme_background, long_task, preserve_pause, startup_snapshot, memory_text
             args_text = arguments.split()
             text = f"/{name}" + (f" {arguments}" if arguments else "")
             if name == "help":
@@ -2567,10 +2653,26 @@ async def _run_session(args: argparse.Namespace, startup: AsyncExitStack, broker
                 output(filesReport(str(cwd), ordered))
                 return True, 0
             if name == "memory":
+                if (args.prompt and args_text[:1] == ["project"] and isMutatingMemoryCommand(text)
+                        and args.project_memory_write is None):
+                    output("项目记忆的批处理写入需要显式指定 --project-memory-write 和当前工作区。")
+                    return True, 1
                 if isMutatingMemoryCommand(text):
                     await pause_settled()
                 try:
-                    handled = await memoryCommand(text, memory_store)
+                    command_root = Path(ctx.cwd or ctx.workspaceRoot).resolve()
+                    command_project = project_memory if command_root == cwd else ProjectMemory(user_root, command_root)
+                    command_store = memory_store if command_root == cwd else MemoryStore(command_root, user_root, compat.DEFAULT_COMPATIBILITY)
+                    enabling = args_text == ["project", "enable"] and not command_project.enabled
+                    handled = await projectCommand(text, command_project, command_store, runtime)
+                    if handled is None:
+                        handled = await memoryCommand(text, command_store, project=command_project)
+                    if enabling and command_root == cwd and command_project.enabled and not args.no_memory:
+                        register_memory_tools()
+                        options["tools"] = api_tools()
+                        startup_snapshot = await buildStartupMemorySnapshot(memory_store, tracked=True, project=project_memory)
+                        memory_text = startup_snapshot.text
+                        await refresh_system_prompt()
                 except Exception:
                     output("记忆操作结果未确认，现场已保留；请先核对原生记忆目录。")
                     return True, 1

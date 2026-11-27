@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .memory_audit import RecallCounts
+from .project_projection import mark_memory
 from .store import MemoryStore, keepKnowledgeForProject, projectIdOf
 from .types import Memory, Scope
 from .validate import Verdict, validateMemory
+
+if TYPE_CHECKING:
+    from .project_store import ProjectMemory
 
 _SMALL_N = 50
 _CHANGED = "(可能已过期:来源已变,请以实时文件为准)"
@@ -40,6 +47,7 @@ class StartupMemorySnapshot:
     text: str = ""
     full_entries: tuple[StartupMemoryEntry, ...] = ()
     index_entries: tuple[StartupMemoryEntry, ...] = ()
+    project_versions: tuple[tuple[str, str], ...] = ()
 
     @property
     def full_ids(self) -> frozenset[tuple[Scope, str]]:
@@ -114,39 +122,72 @@ def buildIndexSection(names: Sequence[str]) -> str:
 
 
 async def buildStartupMemorySnapshot(
-    store: MemoryStore, *, onRecall: Callable[[RecallCounts], None] | None = None,
+    store: MemoryStore, *, onRecall: Callable[[RecallCounts], None] | None = None, tracked: bool = False,
+    project: ProjectMemory | None = None,
 ) -> StartupMemorySnapshot:
     """从同一次读取和筛选生成启动文本与对应的记录身份。
 
     摘要是 MemoryStore 当时读取的 Markdown 原文哈希，避免再次读取时把较新版本写进审计。索引文件仍按名称排除。
     """
     today = store.today()
-    project = projectIdOf(store.cwd)
+    project_id = projectIdOf(store.cwd)
     validated: list[ValidatedMemory] = []
     foreign = 0
     for entry in await store.load(("project", "user", "knowledge")):
         memory = entry.memory
-        if entry.scope == "knowledge" and not keepKnowledgeForProject(memory, project):
+        if entry.scope == "knowledge" and not keepKnowledgeForProject(memory, project_id):
             foreign += 1
             continue
         verdict = await validateMemory(memory, store.cwd, today)
         validated.append(ValidatedMemory(memory, verdict, entry.scope, entry.contentDigest))
     small = sum(item.verdict != "stale" for item in validated) < _SMALL_N
     full = selectFullText(validated, today, _SMALL_N if small else 40)
-    if onRecall is not None:
-        types: dict[str, int] = {}
-        for item in full:
-            types[item.mem.type] = types.get(item.mem.type, 0) + 1
-        try:
-            onRecall({"injected": len(full), "stale": sum(item.verdict == "stale" for item in validated),
-                "changed": sum(item.verdict == "changed" for item in validated), "types": types, "foreign": foreign})
-        except Exception:
-            pass
     index = [] if small else _selectIndexEntries(validated, today, full)
-    text = buildMemorySection(full) + buildIndexSection([item.mem.title or item.mem.name for item in index])
+    project_active = project is not None and await asyncio.to_thread(lambda: project.enabled)
+    if tracked or project_active:
+        def marked(item: ValidatedMemory, value: str) -> str:
+            return mark_memory(f"{item.scope}/{item.mem.name}", item.content_hash, value)
+        text = "\n".join(marked(item, buildMemorySection([item])) for item in full)
+        text += buildIndexSection([marked(item, item.mem.title or item.mem.name) for item in index])
+    else:
+        text = buildMemorySection(full) + buildIndexSection([item.mem.title or item.mem.name for item in index])
 
     def identities(items: Sequence[ValidatedMemory]) -> tuple[StartupMemoryEntry, ...]:
         return tuple(StartupMemoryEntry(item.scope, item.mem.name, item.content_hash)
                      for item in items if item.scope is not None)
 
-    return StartupMemorySnapshot(text, identities(full), identities(index))
+    versions: list[tuple[str, str]] = []
+    if project is not None and project_active:
+        header = ("\n\n" if text else "") + "[本工作区的长期约定 · 适用范围以当前要求为准]\n"
+        additions: list[str] = []
+        used = len(header)
+        covered = {item.mem.text for item in full}
+        for rule in await asyncio.to_thread(project.visible):
+            if rule.kind != "rule" or Path(rule.workspace) != project.cwd or rule.text in covered:
+                continue
+            if rule.source and rule.source != "user_stated" and await asyncio.to_thread(rule.source_status) != "来源一致":
+                continue
+            body = (f"[工程规则 {rule.id} v{rule.version}] 来源：{rule.source or rule.source_id}\n"
+                    + (f"适用条件：{rule.condition}\n" if rule.condition else "") + rule.text)
+            block = mark_memory(rule.id, str(rule.version), body)
+            extra = len(block) + bool(additions)
+            if used + extra > 2400:
+                continue
+            additions.append(block)
+            used += extra
+            versions.append((rule.id, str(rule.version)))
+            covered.add(rule.text)
+        if additions:
+            text += header + "\n".join(additions)
+    if onRecall is not None:
+        types: dict[str, int] = {}
+        for item in full:
+            types[item.mem.type] = types.get(item.mem.type, 0) + 1
+        if versions:
+            types["project_rule"] = len(versions)
+        try:
+            onRecall({"injected": len(full) + len(versions), "stale": sum(item.verdict == "stale" for item in validated),
+                "changed": sum(item.verdict == "changed" for item in validated), "types": types, "foreign": foreign})
+        except Exception:
+            pass
+    return StartupMemorySnapshot(text, identities(full), identities(index), tuple(versions))

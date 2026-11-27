@@ -50,7 +50,13 @@
   /bypass /yolo /mode /goal /task /coordinator /restore /recovery /simplify /remember /review
   /init /batch /skillify /theme /loop /archive
 /files 查看本进程已读文件（含成功Write建立的基线），最多显示50条；重开不恢复读取记录。
-/memory 查看与审核记忆，不暂停；/memory delete <名> [名…] 先暂停当前轮再删除原生记忆。
+/memory 查看记忆与配额。/memory delete <名> [名…] 删除原生 Markdown。
+/memory project enable 在当前工作区开启跨会话工程记忆。status、list 和 show <ID> 查看状态、摘录及来源。
+/memory project link|unlink "<工作区目录>" 管理当前工作区的读取方向。publish <ID> "<目标目录>" 发布单条结论。
+/memory project correct <ID> <新正文> 或 forget <ID> 更正、撤回。下一次模型请求重新核对版本和授权。
+/memory project backfill session <会话ID…> 或 range <起始UTC毫秒> <结束UTC毫秒> 按需补录。
+/memory project vectors status|off|local [本机模型绝对路径]|remote <地址> <模型> [密钥环境变量名]|rebuild 配置检索。
+单次调用要积累到已开启的当前工作区，请显式给 --project-memory-write "<当前工作区>"。
 /skills 在TTY选择技能，pipe列出；/skills on|off <名> 或 /skills bundled|installed|all on|off，重启生效。
 /account（别名/accounts）在TTY打开账户面板；带账户名切换，rm <名>删除，add <key> [provider] [name]添加。
 缺少可用账户时，真实交互终端显示语言、服务商、密钥和信任引导。管道和一次性提示需要先配置账户。

@@ -4,7 +4,7 @@
 
 **Coding Agent 工程参考实现**
 
-[![发布 v2.2.0](https://img.shields.io/badge/Release-v2.2.0-23604B)](https://github.com/hmmgotit/RuoCun/releases/tag/v2.2.0)
+[![发布 v2.3.0](https://img.shields.io/badge/Release-v2.3.0-23604B)](https://github.com/hmmgotit/RuoCun/releases/tag/v2.3.0)
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](docs/install-and-recovery.md)
 [![Windows x64 安装包](https://img.shields.io/badge/Windows-x64-2563A8)](docs/install-and-recovery.md)
 [![MIT 许可证](https://img.shields.io/badge/License-MIT-596575)](LICENSE)
@@ -78,19 +78,19 @@ Terminal-Bench 2.1 是第三方基准，通过 Harbor 在独立容器中评测 A
 
 比如上次分页遇到空页时提前退出了。可以把经验记成「空页仍有下一页游标时，继续翻页」，并附上空页后成功读到下一页的测试证据。遇到相似任务，先核对当前接口是否仍遵循这个规则，再跑相应用例确认。
 
-普通 CLI 默认加载启动记忆快照，`--memory-strategy task` 可为新任务补充相关经验。自动学习默认关闭，显式启用 `--memory-learning controlled` 后，若存可从项目里的纠错和验证结果提炼新经验。 [记忆设计](docs/memory-design.md)
+v2.3.0 默认使用新版记忆实现，普通 CLI 启动时仍加载已有记忆。用 `/memory project enable` 在当前工作区开启工程记忆，跨会话复用规则、失败线索和验证结果。用 `/memory project status` 查看来源范围、占用和检索状态。[记忆设计与操作](docs/memory-design.md)
 
 ## 快速开始
 
-当前 wheel 面向 **Windows x64 / CPython 3.11**。下载 wheel，在文件所在目录打开 PowerShell，安装到独立环境。[v2.2.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.2.0) · [v2.1.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.1.0) · [v2.0.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.0.0)
+当前 wheel 面向 **Windows x64 / CPython 3.11**。下载 wheel，在文件所在目录打开 PowerShell，安装到独立环境。[v2.3.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.3.0) · [v2.2.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.2.0) · [v2.1.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.1.0) · [v2.0.0 下载](https://github.com/hmmgotit/RuoCun/releases/tag/v2.0.0)
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .\ruocun-2.2.0-py311-none-win_amd64.whl
+.\.venv\Scripts\python.exe -m pip install .\ruocun-2.3.0-py311-none-win_amd64.whl
 .\.venv\Scripts\python.exe -m ruocun --cwd "C:\path\to\project"
 ```
 
-v2.2.0 在 Windows、Linux 和 macOS 上默认关闭受管 Shell 的系统沙箱，Bash、Monitor 和子代理的同类命令继续由权限规则和审批决定是否执行。需要系统隔离时，在启动命令中加 `--sandbox`。Windows 使用 Microsoft MXC v1.1.0，Linux 使用 Bubblewrap，macOS 使用 Seatbelt。启用后，后端不可用或无法应用隔离会拒绝该次命令。[Windows MXC 安装配置](docs/windows-sandbox.md)
+受管 Shell 的系统沙箱默认关闭，Bash、Monitor 和子代理的同类命令按权限规则和审批执行。需要系统隔离时，在启动命令中加 `--sandbox`。Windows 使用 Microsoft MXC v1.1.0，Linux 使用 Bubblewrap，macOS 使用 Seatbelt。启用后，后端不可用或无法应用隔离会拒绝该次命令。[Windows MXC 安装配置](docs/windows-sandbox.md)
 
 第一次启动时，终端引导会设置模型服务、API 密钥和工作目录信任。想知道一条用户请求怎样经过模型、工具和结果回流，可以直接读[第 1 章的一次查价案例](https://hmmgotit.github.io/RuoCun/learning/revised/task-loop.html)。
 
